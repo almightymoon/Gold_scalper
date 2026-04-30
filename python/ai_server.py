@@ -16,7 +16,7 @@ import numpy as np
 import zmq
 
 from features import flatten_feature_packet, packet_to_dataframe_row, select_model_features
-from trade_logger import LogPaths, log_feature_packet, log_signal
+from trade_logger import LogPaths, log_feature_packet, log_signal, log_trade_event
 
 
 @dataclass
@@ -311,12 +311,17 @@ def _handle_packet(
     log_feature_packet(logs, packet, flattened)
 
     ptype = packet.get("type")
+    request_id = packet.get("request_id")
     if ptype == "ping":
         resp = {"status": "ok", "time": _now_iso()}
+        if request_id is not None:
+            resp["request_id"] = request_id
         return resp
 
     if ptype != "features":
         resp = {"signal": "HOLD", "confidence": 0.0, "sl_points": 0, "tp_points": 0, "reason": "invalid_packet_type"}
+        if request_id is not None:
+            resp["request_id"] = request_id
         log_signal(logs, packet, resp, transport=transport)
         return resp
 
@@ -329,6 +334,8 @@ def _handle_packet(
         "tp_points": int(max(0, int(resp.get("tp_points", 0) or 0))),
         "reason": str(resp.get("reason", "") or ""),
     }
+    if request_id is not None:
+        resp["request_id"] = request_id
     if resp["signal"] not in {"BUY", "SELL", "HOLD"}:
         resp["signal"] = "HOLD"
     log_signal(logs, packet, resp, transport=transport)
@@ -414,11 +421,13 @@ def run_file_bridge(cfg: ServerConfig, model: AiModel, logs: LogPaths) -> None:
     req_path = d / "request.json"
     resp_path = d / "response.json"
     stamp_path = d / "response.stamp"
+    trade_event_path = d / "trade_event.json"
     log = logging.getLogger("gold_scalper")
     log.info("File bridge enabled at %s", str(d))
     log.info("Waiting for %s", str(req_path))
 
     last_seen_mtime = 0.0
+    last_trade_mtime = 0.0
     while True:
         try:
             if req_path.exists():
@@ -459,6 +468,49 @@ def run_file_bridge(cfg: ServerConfig, model: AiModel, logs: LogPaths) -> None:
                             resp = _handle_packet(packet, model=model, logs=logs, transport="file")
                     resp_path.write_text(json.dumps(resp, ensure_ascii=False), encoding="utf-8")
                     stamp_path.write_text(str(time.time()), encoding="utf-8")
+
+            # Optional: MT5 closed-trade event ingestion (one-shot file)
+            if trade_event_path.exists():
+                tm = trade_event_path.stat().st_mtime
+                if tm > last_trade_mtime:
+                    last_trade_mtime = tm
+                    raw_bytes = trade_event_path.read_bytes()
+                    text: Optional[str] = None
+                    for enc in ("utf-8-sig", "utf-16", "utf-16le", "utf-16be", "cp1252"):
+                        try:
+                            text = raw_bytes.decode(enc)
+                            if text.lstrip().startswith(("{", "[")):
+                                break
+                        except Exception:
+                            text = None
+                    if text is not None:
+                        try:
+                            ev = json.loads(text)
+                        except Exception:
+                            ev = None
+                        if isinstance(ev, dict):
+                            log_trade_event(
+                                logs,
+                                time=str(ev.get("time", "")),
+                                symbol=str(ev.get("symbol", "")),
+                                event=str(ev.get("event", "CLOSE")),
+                                magic=int(ev.get("magic")) if ev.get("magic") is not None else None,
+                                ticket=int(ev.get("ticket")) if ev.get("ticket") is not None else None,
+                                side=str(ev.get("side", "")) if ev.get("side") is not None else None,
+                                volume=float(ev.get("volume")) if ev.get("volume") is not None else None,
+                                price=float(ev.get("price")) if ev.get("price") is not None else None,
+                                sl=float(ev.get("sl")) if ev.get("sl") is not None else None,
+                                tp=float(ev.get("tp")) if ev.get("tp") is not None else None,
+                                profit=float(ev.get("profit")) if ev.get("profit") is not None else None,
+                                reason=str(ev.get("reason", "")),
+                                extra=ev.get("extra", {}) if isinstance(ev.get("extra"), dict) else {},
+                            )
+                    # Rename so it won't be re-processed (best effort).
+                    try:
+                        suffix = str(int(time.time()))
+                        trade_event_path.rename(d / f"trade_event.processed_{suffix}.json")
+                    except Exception:
+                        pass
         except Exception:
             # Keep running even on filesystem errors.
             pass

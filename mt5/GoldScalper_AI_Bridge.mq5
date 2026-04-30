@@ -22,6 +22,8 @@ input bool   InpAllowLiveTrading       = false;
 input string InpPythonHost             = "127.0.0.1";
 input int    InpPythonPort             = 5555;    // ZMQ port on python (TCP fallback uses +1)
 input bool   InpUseFileFallback        = true;    // safer default
+input bool   InpAllowMinLotOverride    = true;    // allow min lot ONLY if risk at min lot is safe
+input double InpMaxRiskAtMinLotPercent = 2.0;     // max % risk allowed if using SYMBOL_VOLUME_MIN
 
 // -------------------- Globals --------------------
 CTrade g_trade;
@@ -32,6 +34,10 @@ string g_last_reason = "";
 string g_conn_status = "DISCONNECTED";
 datetime g_last_ai_time = 0;
 bool g_kill_switch = false;
+string g_last_request_id = "";
+string g_last_ping = "N/A";
+string g_last_day_key = "";
+ulong  g_req_seq = 0;
 
 // Indicator handles
 int h_m1_ema9 = INVALID_HANDLE, h_m1_ema21 = INVALID_HANDLE, h_m1_ema50 = INVALID_HANDLE;
@@ -44,6 +50,7 @@ string g_bridge_dir_common = "";
 string g_req_file = "request.json";
 string g_resp_file = "response.json";
 string g_stamp_file = "response.stamp";
+string g_trade_event_file = "trade_event.json";
 bool   g_common_subdir_ok = false;
 
 // CSV log files (COMMON)
@@ -57,6 +64,13 @@ string TimeToISO(datetime t)
    MqlDateTime dt; TimeToStruct(t, dt);
    return StringFormat("%04d-%02d-%02dT%02d:%02d:%02d",
                        dt.year, dt.mon, dt.day, dt.hour, dt.min, dt.sec);
+}
+
+string NewRequestId()
+{
+   // Unique enough for local bridge: GMT timestamp + seq
+   g_req_seq++;
+   return StringFormat("%s_%I64u", TimeToISO(TimeGMT()), (ulong)g_req_seq);
 }
 
 int HourGMT(datetime t)
@@ -115,9 +129,9 @@ double NormalizeVolume(const string sym, double vol)
 
 bool EnsureTradeFillingMode(const string sym)
 {
-   int fill = (int)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
-   if(fill == SYMBOL_FILLING_FOK) g_trade.SetTypeFilling(ORDER_FILLING_FOK);
-   else if(fill == SYMBOL_FILLING_IOC) g_trade.SetTypeFilling(ORDER_FILLING_IOC);
+   long fill = (long)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
+   if((fill & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) g_trade.SetTypeFilling(ORDER_FILLING_FOK);
+   else if((fill & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) g_trade.SetTypeFilling(ORDER_FILLING_IOC);
    else g_trade.SetTypeFilling(ORDER_FILLING_RETURN);
    return true;
 }
@@ -142,6 +156,26 @@ double GetDayStartBalance()
       GlobalVariableSet(name, AccountInfoDouble(ACCOUNT_BALANCE));
    }
    return GlobalVariableGet(name);
+}
+
+void ResetDayStartBalance()
+{
+   string name = GVName("day_start_balance");
+   GlobalVariableSet(name, AccountInfoDouble(ACCOUNT_BALANCE));
+}
+
+void CheckDailyReset()
+{
+   string dk = DayKey();
+   if(g_last_day_key == "")
+      g_last_day_key = dk;
+   if(dk != g_last_day_key)
+   {
+      g_last_day_key = dk;
+      g_kill_switch = false;
+      ResetDayStartBalance();
+      Print("Daily reset: kill_switch cleared, day_start_balance reset.");
+   }
 }
 
 int GetTradesToday()
@@ -344,8 +378,27 @@ bool TcpRequest(const string host, int port, const string req, string &resp, int
    return true;
 }
 
+bool TcpRequestExpectId(const string host, int port, const string req_json, const string request_id, string &resp_json, int timeout_ms, string &err)
+{
+   resp_json = "";
+   if(!TcpRequest(host, port, req_json, resp_json, timeout_ms, err))
+      return false;
+   string rid = "";
+   if(!ExtractJsonStringField(resp_json, "request_id", rid))
+   {
+      err = "missing_request_id_in_response";
+      return false;
+   }
+   if(rid != request_id)
+   {
+      err = StringFormat("request_id_mismatch: got=%s expected=%s", rid, request_id);
+      return false;
+   }
+   return true;
+}
+
 // -------------------- Transport: File bridge --------------------
-bool FileBridgeRequest(const string req_json, string &resp_json, string &err)
+bool FileBridgeRequest(const string req_json, const string request_id, string &resp_json, string &err)
 {
    resp_json = "";
    err = "";
@@ -375,12 +428,19 @@ bool FileBridgeRequest(const string req_json, string &resp_json, string &err)
             resp_json = FileReadString(hr);
             FileClose(hr);
             if(StringLen(resp_json) > 0)
-               return true;
+            {
+               string rid = "";
+               if(ExtractJsonStringField(resp_json, "request_id", rid))
+               {
+                  if(rid == request_id)
+                     return true;
+               }
+            }
          }
       }
       Sleep(120);
    }
-   err = "file_bridge timeout waiting for response.json";
+   err = "file_bridge timeout waiting for matching response.json";
    return false;
 }
 
@@ -470,14 +530,23 @@ bool ParseAiResponse(const string resp_json, string &signal, double &conf, int &
    return true;
 }
 
+bool ExtractJsonStatusOk(const string json, bool &ok)
+{
+   ok = false;
+   string status = "";
+   if(!ExtractJsonStringField(json, "status", status)) return false;
+   if(status == "ok") ok = true;
+   return true;
+}
+
 // -------------------- Feature collection --------------------
-bool CopySingleValue(int handle, int buffer, double &out)
+bool CopySingleValueShift(int handle, int buffer, int shift, double &out)
 {
    out = 0.0;
    if(handle == INVALID_HANDLE) return false;
    double arr[];
    ArraySetAsSeries(arr, true);
-   if(CopyBuffer(handle, buffer, 0, 1, arr) != 1) return false;
+   if(CopyBuffer(handle, buffer, shift, 1, arr) != 1) return false;
    out = arr[0];
    return true;
 }
@@ -513,30 +582,32 @@ bool BuildFeaturesJson(string &out_json)
 
    // Indicators (M1)
    double m1_ema9, m1_ema21, m1_ema50, m1_rsi14, m1_atr14, m1_adx14, m1_plusdi, m1_minusdi;
-   if(!CopySingleValue(h_m1_ema9, 0, m1_ema9)) return false;
-   if(!CopySingleValue(h_m1_ema21, 0, m1_ema21)) return false;
-   if(!CopySingleValue(h_m1_ema50, 0, m1_ema50)) return false;
-   if(!CopySingleValue(h_m1_rsi14, 0, m1_rsi14)) return false;
-   if(!CopySingleValue(h_m1_atr14, 0, m1_atr14)) return false;
-   if(!CopySingleValue(h_m1_adx14, 0, m1_adx14)) return false;
-   if(!CopySingleValue(h_m1_adx14, 1, m1_plusdi)) return false;
-   if(!CopySingleValue(h_m1_adx14, 2, m1_minusdi)) return false;
+   if(!CopySingleValueShift(h_m1_ema9, 0, 1, m1_ema9)) return false;
+   if(!CopySingleValueShift(h_m1_ema21, 0, 1, m1_ema21)) return false;
+   if(!CopySingleValueShift(h_m1_ema50, 0, 1, m1_ema50)) return false;
+   if(!CopySingleValueShift(h_m1_rsi14, 0, 1, m1_rsi14)) return false;
+   if(!CopySingleValueShift(h_m1_atr14, 0, 1, m1_atr14)) return false;
+   if(!CopySingleValueShift(h_m1_adx14, 0, 1, m1_adx14)) return false;
+   if(!CopySingleValueShift(h_m1_adx14, 1, 1, m1_plusdi)) return false;
+   if(!CopySingleValueShift(h_m1_adx14, 2, 1, m1_minusdi)) return false;
 
    // Indicators (M5)
    double m5_ema20, m5_ema50, m5_rsi14, m5_atr14, m5_adx14, m5_plusdi, m5_minusdi;
-   if(!CopySingleValue(h_m5_ema20, 0, m5_ema20)) return false;
-   if(!CopySingleValue(h_m5_ema50, 0, m5_ema50)) return false;
-   if(!CopySingleValue(h_m5_rsi14, 0, m5_rsi14)) return false;
-   if(!CopySingleValue(h_m5_atr14, 0, m5_atr14)) return false;
-   if(!CopySingleValue(h_m5_adx14, 0, m5_adx14)) return false;
-   if(!CopySingleValue(h_m5_adx14, 1, m5_plusdi)) return false;
-   if(!CopySingleValue(h_m5_adx14, 2, m5_minusdi)) return false;
+   if(!CopySingleValueShift(h_m5_ema20, 0, 1, m5_ema20)) return false;
+   if(!CopySingleValueShift(h_m5_ema50, 0, 1, m5_ema50)) return false;
+   if(!CopySingleValueShift(h_m5_rsi14, 0, 1, m5_rsi14)) return false;
+   if(!CopySingleValueShift(h_m5_atr14, 0, 1, m5_atr14)) return false;
+   if(!CopySingleValueShift(h_m5_adx14, 0, 1, m5_adx14)) return false;
+   if(!CopySingleValueShift(h_m5_adx14, 1, 1, m5_plusdi)) return false;
+   if(!CopySingleValueShift(h_m5_adx14, 2, 1, m5_minusdi)) return false;
 
    int open_ea_trades = GetOpenEATrades();
    int trades_today = GetTradesToday();
    int hour_gmt = HourGMT(TimeGMT());
 
    string iso_time = TimeToISO(TimeGMT());
+   string request_id = NewRequestId();
+   g_last_request_id = request_id;
 
    // Build JSON packet
    string features =
@@ -571,6 +642,7 @@ bool BuildFeaturesJson(string &out_json)
 
    out_json =
       "{"
+      "\"request_id\":\"" + JsonEscape(request_id) + "\","
       "\"type\":\"features\","
       "\"symbol\":\"" + JsonEscape(sym) + "\","
       "\"time\":\"" + iso_time + "\","
@@ -713,8 +785,28 @@ bool CalcVolumeForRisk(const string sym, ENUM_ORDER_TYPE order_type, double entr
    double vmax = SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
    if(vol < vmin)
    {
-      why = StringFormat("risk_unsafe: computed_volume=%.4f < min=%.4f", vol, vmin);
-      return false; // do not force min lot if risk is unsafe
+      // Optional: controlled min-lot override if min-lot risk is still within safe bounds.
+      if(!InpAllowMinLotOverride)
+      {
+         why = StringFormat("risk_unsafe: computed_volume=%.4f < min=%.4f", vol, vmin);
+         return false;
+      }
+      double sl_profit_min = 0.0;
+      if(!OrderCalcProfit(order_type, sym, vmin, entry_price, sl_price, sl_profit_min))
+      {
+         why = StringFormat("OrderCalcProfit(minlot) failed (%d)", GetLastError());
+         return false;
+      }
+      double minlot_risk = -sl_profit_min;
+      double risk_pct = (balance > 0.0 ? (minlot_risk / balance * 100.0) : 100.0);
+      if(risk_pct <= InpMaxRiskAtMinLotPercent)
+      {
+         out_volume = NormalizeVolume(sym, vmin);
+         why = StringFormat("min_lot_override: computed=%.4f using=%.4f risk=%.2f%%", vol, out_volume, risk_pct);
+         return true;
+      }
+      why = StringFormat("min_lot_risk_too_high: computed=%.4f min=%.4f risk=%.2f%% > %.2f%%", vol, vmin, risk_pct, InpMaxRiskAtMinLotPercent);
+      return false;
    }
    if(vol > vmax) vol = vmax;
    vol = NormalizeVolume(sym, vol);
@@ -767,8 +859,45 @@ bool ExecuteSignal(const string signal, double confidence, int sl_points, int tp
       LogTradeEvent(iso_time, sym, "SKIP", signal, 0.0, entry, sl, tp, 0.0, why);
       return false;
    }
+   // If min-lot override happened, record it in the comment logs
+   if(StringFind(why, "min_lot_override") >= 0)
+      Print("Info: ", why);
    if(!MarginOk(sym, order_type, volume, entry, why))
    {
+      Print("Skip: ", why);
+      LogTradeEvent(iso_time, sym, "SKIP", signal, volume, entry, sl, tp, 0.0, why);
+      return false;
+   }
+
+   // OrderCheck preflight
+   MqlTradeRequest rq;
+   MqlTradeCheckResult ck;
+   ZeroMemory(rq);
+   ZeroMemory(ck);
+   rq.action   = TRADE_ACTION_DEAL;
+   rq.symbol   = sym;
+   rq.magic    = (ulong)InpMagicNumber;
+   rq.volume   = volume;
+   rq.price    = entry;
+   rq.sl       = sl;
+   rq.tp       = tp;
+   rq.deviation= 20;
+   rq.type     = (signal=="BUY" ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+   rq.type_filling = g_trade.GetTypeFilling();
+   rq.type_time = ORDER_TIME_GTC;
+
+   if(!OrderCheck(rq, ck))
+   {
+      why = StringFormat("OrderCheck failed (%d)", GetLastError());
+      Print("Skip: ", why);
+      LogTradeEvent(iso_time, sym, "SKIP", signal, volume, entry, sl, tp, 0.0, why);
+      return false;
+   }
+   // Accept only non-error retcodes
+   if(ck.retcode != TRADE_RETCODE_DONE && ck.retcode != TRADE_RETCODE_PLACED && ck.retcode != TRADE_RETCODE_ACCEPTED)
+   {
+      why = StringFormat("OrderCheck reject: retcode=%d comment=%s margin=%.2f free=%.2f",
+                         ck.retcode, ck.comment, ck.margin, AccountInfoDouble(ACCOUNT_MARGIN_FREE));
       Print("Skip: ", why);
       LogTradeEvent(iso_time, sym, "SKIP", signal, volume, entry, sl, tp, 0.0, why);
       return false;
@@ -905,6 +1034,7 @@ void UpdateDashboard()
       "GoldScalper_AI_Bridge\n"
       "Symbol: " + sym + (SymbolLooksLikeGold(sym) ? "" : " (not XAU?)") + "\n"
       "Conn: " + g_conn_status + "\n"
+      "Last ping: " + g_last_ping + "\n"
       "Last signal: " + g_last_signal + "  conf=" + DoubleToString(g_last_confidence,2) + "\n"
       "Reason: " + g_last_reason + "\n"
       "Spread(points): " + (string)spread + " / max " + (string)InpMaxSpreadPoints + "\n"
@@ -916,6 +1046,36 @@ void UpdateDashboard()
       "Mode: " + (InpUseFileFallback ? "FILE" : "TCP") + "\n";
 
    Comment(txt);
+}
+
+bool SendPing()
+{
+   string request_id = NewRequestId();
+   string req = "{"
+                "\"request_id\":\"" + JsonEscape(request_id) + "\","
+                "\"type\":\"ping\""
+                "}";
+   string resp = "";
+   string err = "";
+   bool ok = false;
+   if(InpUseFileFallback)
+      ok = FileBridgeRequest(req, request_id, resp, err);
+   else
+      ok = TcpRequestExpectId(InpPythonHost, InpPythonPort + 1, req, request_id, resp, 1200, err);
+
+   if(!ok)
+   {
+      g_last_ping = "FAIL: " + err;
+      return false;
+   }
+   bool status_ok=false;
+   if(ExtractJsonStatusOk(resp, status_ok) && status_ok)
+   {
+      g_last_ping = "OK";
+      return true;
+   }
+   g_last_ping = "FAIL: bad_status";
+   return false;
 }
 
 // -------------------- New-bar detection --------------------
@@ -974,6 +1134,10 @@ int OnInit()
 
    // Initialize daily start balance GV
    GetDayStartBalance();
+   g_last_day_key = DayKey();
+
+   // Connection self-test (non-fatal)
+   SendPing();
 
    return INIT_SUCCEEDED;
 }
@@ -996,6 +1160,7 @@ void OnDeinit(const int reason)
 
 void OnTick()
 {
+   CheckDailyReset();
    ManagePositions();
 
    if(IsNewM1Bar())
@@ -1016,13 +1181,13 @@ void OnTick()
       if(InpUseFileFallback)
       {
          transport = "file";
-         ok = FileBridgeRequest(req_json, resp_json, err);
+         ok = FileBridgeRequest(req_json, g_last_request_id, resp_json, err);
       }
       else
       {
          transport = "tcp";
          int tcp_port = InpPythonPort + 1; // python TCP fallback listens on port+1 by default
-         ok = TcpRequest(InpPythonHost, tcp_port, req_json, resp_json, 1200, err);
+         ok = TcpRequestExpectId(InpPythonHost, tcp_port, req_json, g_last_request_id, resp_json, 1200, err);
       }
 
       if(!ok)
@@ -1065,5 +1230,67 @@ void OnTick()
    }
 
    UpdateDashboard();
+}
+
+void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
+{
+   // Log closed trades for this EA (magic + symbol).
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
+      return;
+   ulong deal = trans.deal;
+   if(deal == 0)
+      return;
+   if(!HistoryDealSelect(deal))
+      return;
+
+   long magic = (long)HistoryDealGetInteger(deal, DEAL_MAGIC);
+   if(magic != InpMagicNumber)
+      return;
+   string sym = (string)HistoryDealGetString(deal, DEAL_SYMBOL);
+   if(sym != _Symbol)
+      return;
+
+   long entry = (long)HistoryDealGetInteger(deal, DEAL_ENTRY);
+   if(entry != DEAL_ENTRY_OUT)
+      return;
+
+   long dtype = (long)HistoryDealGetInteger(deal, DEAL_TYPE);
+   string side = (dtype == DEAL_TYPE_SELL ? "SELL" : "BUY");
+   double volume = HistoryDealGetDouble(deal, DEAL_VOLUME);
+   double price  = HistoryDealGetDouble(deal, DEAL_PRICE);
+   double profit = HistoryDealGetDouble(deal, DEAL_PROFIT);
+   double commission = HistoryDealGetDouble(deal, DEAL_COMMISSION);
+   double swap = HistoryDealGetDouble(deal, DEAL_SWAP);
+
+   string iso_time = TimeToISO(TimeGMT());
+   string reason = "deal_close";
+   LogTradeEvent(iso_time, sym, "CLOSE", side, volume, price, 0.0, 0.0, profit, reason);
+
+   // Emit a trade_event.json for python ingestion (file-bridge).
+   string ev_json =
+      "{"
+      "\"time\":\"" + JsonEscape(iso_time) + "\","
+      "\"symbol\":\"" + JsonEscape(sym) + "\","
+      "\"event\":\"CLOSE\","
+      "\"magic\":" + (string)magic + ","
+      "\"ticket\":" + (string)deal + ","
+      "\"side\":\"" + side + "\","
+      "\"volume\":" + DoubleToString(volume, 2) + ","
+      "\"price\":" + DoubleToString(price, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS)) + ","
+      "\"profit\":" + DoubleToString(profit, 2) + ","
+      "\"reason\":\"" + JsonEscape(reason) + "\","
+      "\"extra\":{"
+         "\"commission\":" + DoubleToString(commission, 2) + ","
+         "\"swap\":" + DoubleToString(swap, 2) +
+      "}"
+      "}";
+
+   string path = CommonRelPath(g_trade_event_file);
+   int h = FileOpen(path, FILE_WRITE|FILE_TXT|FILE_COMMON);
+   if(h != INVALID_HANDLE)
+   {
+      FileWriteString(h, ev_json);
+      FileClose(h);
+   }
 }
 
