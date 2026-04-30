@@ -897,8 +897,16 @@ bool ExecuteSignal(const string signal, double confidence, int sl_points, int tp
       LogTradeEvent(iso_time, sym, "SKIP", signal, volume, entry, sl, tp, 0.0, why);
       return false;
    }
-   // Accept only OK retcodes (avoid using retcodes not defined on some builds)
-   if(ck.retcode != TRADE_RETCODE_DONE && ck.retcode != TRADE_RETCODE_PLACED && ck.retcode != TRADE_RETCODE_DONE_PARTIAL)
+   // Accept only OK retcodes (tolerate some builds returning retcode=0 with "done")
+   string cmt = ck.comment;
+   StringToLower(cmt);
+   bool check_ok =
+      (ck.retcode == 0 && StringFind(cmt, "done") >= 0) ||
+      ck.retcode == TRADE_RETCODE_DONE ||
+      ck.retcode == TRADE_RETCODE_PLACED ||
+      ck.retcode == TRADE_RETCODE_DONE_PARTIAL;
+
+   if(!check_ok)
    {
       why = StringFormat("OrderCheck reject: retcode=%d comment=%s margin=%.2f free=%.2f",
                          ck.retcode, ck.comment, ck.margin, AccountInfoDouble(ACCOUNT_MARGIN_FREE));
@@ -1070,15 +1078,18 @@ bool SendPing()
    if(!ok)
    {
       g_last_ping = "FAIL: " + err;
+      g_conn_status = "DISCONNECTED";
       return false;
    }
    bool status_ok=false;
    if(ExtractJsonStatusOk(resp, status_ok) && status_ok)
    {
       g_last_ping = "OK";
+      g_conn_status = "CONNECTED";
       return true;
    }
    g_last_ping = "FAIL: bad_status";
+   g_conn_status = "DISCONNECTED";
    return false;
 }
 
