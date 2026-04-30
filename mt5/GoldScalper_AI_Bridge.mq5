@@ -883,7 +883,11 @@ bool ExecuteSignal(const string signal, double confidence, int sl_points, int tp
    rq.tp       = tp;
    rq.deviation= 20;
    rq.type     = (signal=="BUY" ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
-   rq.type_filling = g_trade.GetTypeFilling();
+   // Some MT5 builds do not expose CTrade::GetTypeFilling(); compute from symbol filling flags.
+   long fill_flags = (long)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
+   if((fill_flags & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) rq.type_filling = ORDER_FILLING_FOK;
+   else if((fill_flags & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) rq.type_filling = ORDER_FILLING_IOC;
+   else rq.type_filling = ORDER_FILLING_RETURN;
    rq.type_time = ORDER_TIME_GTC;
 
    if(!OrderCheck(rq, ck))
@@ -893,8 +897,8 @@ bool ExecuteSignal(const string signal, double confidence, int sl_points, int tp
       LogTradeEvent(iso_time, sym, "SKIP", signal, volume, entry, sl, tp, 0.0, why);
       return false;
    }
-   // Accept only non-error retcodes
-   if(ck.retcode != TRADE_RETCODE_DONE && ck.retcode != TRADE_RETCODE_PLACED && ck.retcode != TRADE_RETCODE_ACCEPTED)
+   // Accept only OK retcodes (avoid using retcodes not defined on some builds)
+   if(ck.retcode != TRADE_RETCODE_DONE && ck.retcode != TRADE_RETCODE_PLACED && ck.retcode != TRADE_RETCODE_DONE_PARTIAL)
    {
       why = StringFormat("OrderCheck reject: retcode=%d comment=%s margin=%.2f free=%.2f",
                          ck.retcode, ck.comment, ck.margin, AccountInfoDouble(ACCOUNT_MARGIN_FREE));
