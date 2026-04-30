@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import signal
 import socket
 import threading
 import time
@@ -77,7 +79,7 @@ class AiModel:
             self.feature_columns = None
         return True
 
-    def predict(self, packet: Dict[str, Any]) -> Optional[Tuple[str, float]]:
+    def predict_win_probability(self, packet: Dict[str, Any]) -> Optional[float]:
         if self.model is None:
             return None
 
@@ -91,21 +93,24 @@ class AiModel:
             X = X[self.feature_columns]
             cols = self.feature_columns
 
-        X = X.fillna(method="ffill", axis=1).fillna(0.0)
+        X = X.ffill(axis=1).fillna(0.0)
 
         if hasattr(self.model, "predict_proba"):
             proba = self.model.predict_proba(X)[0]
             classes = list(getattr(self.model, "classes_", []))
-            if not classes:
-                pred = self.model.predict(X)[0]
-                return str(pred), 0.55
-            best_idx = int(np.argmax(proba))
-            pred = str(classes[best_idx])
-            conf = float(proba[best_idx])
-            return pred, conf
+            # Expect binary {0,1}. If not, fall back to max probability.
+            if 1 in classes:
+                return float(proba[classes.index(1)])
+            if "1" in [str(c) for c in classes]:
+                return float(proba[[str(c) for c in classes].index("1")])
+            return float(np.max(proba))
 
-        pred = self.model.predict(X)[0]
-        return str(pred), 0.55
+        # No proba available: treat prediction as weak confidence.
+        try:
+            pred = int(self.model.predict(X)[0])
+            return 0.60 if pred == 1 else 0.40
+        except Exception:
+            return None
 
 
 def dummy_rule_ai(packet: Dict[str, Any]) -> Dict[str, Any]:
@@ -175,22 +180,22 @@ def dummy_rule_ai(packet: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def decide(packet: Dict[str, Any], model: AiModel) -> Dict[str, Any]:
-    # Try model first (if loaded), else dummy rule AI.
-    mp = model.predict(packet)
-    if mp is None:
-        return dummy_rule_ai(packet)
-
-    pred, conf = mp
-    pred = pred.upper().strip()
-    if pred not in {"BUY", "SELL", "HOLD"}:
-        pred = "HOLD"
-
-    # Keep SL/TP from rule logic (safe defaults) while model provides direction/confidence.
+    # Architecture note:
+    # - Direction comes from the rule engine (BUY/SELL/HOLD)
+    # - The ML model is trained as a win-probability classifier (TP-before-SL), not direction
+    # - We use model output as a confidence overlay, never for lot sizing or risk overrides.
     rule = dummy_rule_ai(packet)
-    rule["signal"] = pred
-    rule["confidence"] = float(_clamp(conf, 0.0, 1.0))
-    rule["reason"] = f"model: {pred} (conf={rule['confidence']:.2f}) | {rule.get('reason','')}"
-    if pred == "HOLD":
+    p_win = model.predict_win_probability(packet)
+    if p_win is None:
+        return rule
+
+    p_win = float(_clamp(p_win, 0.0, 1.0))
+    base_conf = float(rule.get("confidence", 0.0) or 0.0)
+    # Combine: keep rule as baseline, then nudge by model probability.
+    combined = 0.55 * base_conf + 0.45 * p_win
+    rule["confidence"] = float(_clamp(combined, 0.0, 1.0))
+    rule["reason"] = f"model_pwin={p_win:.2f} combined_conf={rule['confidence']:.2f} | {rule.get('reason','')}"
+    if rule.get("signal") == "HOLD":
         rule["confidence"] = min(rule["confidence"], 0.55)
     return rule
 
@@ -205,7 +210,12 @@ def _handle_packet(
     flattened = flatten_feature_packet(packet)
     log_feature_packet(logs, packet, flattened)
 
-    if packet.get("type") != "features":
+    ptype = packet.get("type")
+    if ptype == "ping":
+        resp = {"status": "ok", "time": _now_iso()}
+        return resp
+
+    if ptype != "features":
         resp = {"signal": "HOLD", "confidence": 0.0, "sl_points": 0, "tp_points": 0, "reason": "invalid_packet_type"}
         log_signal(logs, packet, resp, transport=transport)
         return resp
@@ -231,7 +241,8 @@ def run_zmq_rep(cfg: ServerConfig, model: AiModel, logs: LogPaths) -> None:
     sock.setsockopt(zmq.LINGER, 0)
     endpoint = f"tcp://{cfg.host}:{cfg.zmq_port}"
     sock.bind(endpoint)
-    print(f"[{_now_iso()}] ZeroMQ REP listening on {endpoint}")
+    log = logging.getLogger("gold_scalper")
+    log.info("ZeroMQ REP listening on %s", endpoint)
 
     while True:
         raw = sock.recv()
@@ -278,16 +289,22 @@ def _tcp_client_handler(conn: socket.socket, addr: Tuple[str, int], cfg: ServerC
 
 
 def run_tcp_fallback(cfg: ServerConfig, model: AiModel, logs: LogPaths) -> None:
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((cfg.host, cfg.tcp_port))
-    srv.listen(32)
-    print(f"[{_now_iso()}] TCP fallback listening on {cfg.host}:{cfg.tcp_port} (JSON line protocol)")
-
+    log = logging.getLogger("gold_scalper")
     while True:
-        conn, addr = srv.accept()
-        th = threading.Thread(target=_tcp_client_handler, args=(conn, addr, cfg, model, logs), daemon=True)
-        th.start()
+        try:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((cfg.host, cfg.tcp_port))
+            srv.listen(32)
+            log.info("TCP fallback listening on %s:%s (JSON line protocol)", cfg.host, cfg.tcp_port)
+
+            while True:
+                conn, addr = srv.accept()
+                th = threading.Thread(target=_tcp_client_handler, args=(conn, addr, cfg, model, logs), daemon=True)
+                th.start()
+        except Exception as e:
+            log.exception("TCP fallback crashed: %s. Restarting in 5s...", e)
+            time.sleep(5.0)
 
 
 def run_file_bridge(cfg: ServerConfig, model: AiModel, logs: LogPaths) -> None:
@@ -297,8 +314,9 @@ def run_file_bridge(cfg: ServerConfig, model: AiModel, logs: LogPaths) -> None:
     req_path = d / "request.json"
     resp_path = d / "response.json"
     stamp_path = d / "response.stamp"
-    print(f"[{_now_iso()}] File bridge enabled at {str(d)}")
-    print(f"[{_now_iso()}] Waiting for {str(req_path)}")
+    log = logging.getLogger("gold_scalper")
+    log.info("File bridge enabled at %s", str(d))
+    log.info("Waiting for %s", str(req_path))
 
     last_seen_mtime = 0.0
     while True:
@@ -362,6 +380,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    log = logging.getLogger("gold_scalper")
+
+    def _shutdown(sig, frame):
+        log.info("Shutting down (signal=%s)...", sig)
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
     args = parse_args()
     cfg = ServerConfig(
         host=args.host,
@@ -384,14 +412,14 @@ def main() -> None:
     model = AiModel(cfg.models_dir)
     loaded = model.load_if_available()
     if loaded:
-        print(f"[{_now_iso()}] Loaded model from {str(model.model_path)}")
+        log.info("Loaded model from %s", str(model.model_path))
     else:
-        print(f"[{_now_iso()}] No model found at {str(model.model_path)} (using dummy rule logic)")
+        log.info("No model found at %s (using dummy rule logic)", str(model.model_path))
 
-    print(f"[{_now_iso()}] Logging CSVs to: {str(cfg.data_dir)}")
-    print(f"[{_now_iso()}]  - {str(logs.live_features_csv)}")
-    print(f"[{_now_iso()}]  - {str(logs.signals_csv)}")
-    print(f"[{_now_iso()}]  - {str(logs.trades_csv)}")
+    log.info("Logging CSVs to: %s", str(cfg.data_dir))
+    log.info(" - %s", str(logs.live_features_csv))
+    log.info(" - %s", str(logs.signals_csv))
+    log.info(" - %s", str(logs.trades_csv))
 
     threads: list[threading.Thread] = []
     if cfg.enable_tcp_fallback:

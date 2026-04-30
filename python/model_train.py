@@ -121,8 +121,8 @@ def build_training_set(
         raise RuntimeError("No BUY/SELL rows found in signals.csv. Need more collected data.")
 
     # Merge-asof per symbol: nearest feature row at or before the signal time.
-    rows = []
-    labels = []
+    rows: list[dict[str, Any]] = []
+    labels: list[int] = []
     for sym, sym_signals in sdf.groupby("symbol", sort=False):
         sym_feats = fdf[fdf["symbol"] == sym].copy()
         if sym_feats.empty:
@@ -159,13 +159,19 @@ def build_training_set(
             if y is None:
                 continue
 
-            rows.append(sym_feats.iloc[idx].to_dict())
+            d = sym_feats.iloc[idx].to_dict()
+            d["time_ts"] = sym_feats.iloc[idx]["time_ts"]
+            d["signal_dir"] = str(r["signal"])
             labels.append(int(y))
+            rows.append(d)
 
     if not rows:
         raise RuntimeError("Could not build any labeled samples. Collect more data or increase horizon.")
 
     Xdf = pd.DataFrame(rows)
+    # Keep chronological order to support time-based splitting.
+    if "time_ts" in Xdf.columns:
+        Xdf = Xdf.sort_values("time_ts").reset_index(drop=True)
     yser = pd.Series(labels, name="label")
     return Xdf, yser
 
@@ -207,10 +213,24 @@ def train(paths: Paths, *, horizon_rows: int, point_value: float) -> None:
     signals_df = pd.read_csv(paths.signals_csv)
 
     Xraw, y = build_training_set(features_df, signals_df, horizon_rows=horizon_rows, default_point_value=point_value)
+    # Time-based split to avoid look-ahead bias.
+    if "time_ts" in Xraw.columns:
+        order = np.argsort(pd.to_datetime(Xraw["time_ts"], utc=True, errors="coerce").astype("int64").fillna(0).values)
+        Xraw = Xraw.iloc[order].reset_index(drop=True)
+        y = y.iloc[order].reset_index(drop=True)
+
+    # Drop non-feature columns
+    for c in ["time", "symbol", "type", "time_ts", "signal_dir"]:
+        if c in Xraw.columns:
+            Xraw = Xraw.drop(columns=[c])
     X, feature_cols = select_model_features(Xraw)
     X = X.fillna(0.0)
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y)
+    split = int(len(X) * 0.75)
+    if split <= 10 or (len(X) - split) <= 5:
+        raise RuntimeError("Not enough labeled samples for a time-based split. Collect more data.")
+    X_train, X_test = X.iloc[:split], X.iloc[split:]
+    y_train, y_test = y.iloc[:split], y.iloc[split:]
 
     clf = RandomForestClassifier(
         n_estimators=450,
