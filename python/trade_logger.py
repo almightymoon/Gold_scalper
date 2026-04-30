@@ -55,9 +55,35 @@ def _rotate_if_header_mismatch(path: Path, fieldnames: list[str]) -> None:
         return
 
 
+def _rotate_daily(path: Path) -> None:
+    """
+    Rotate CSVs daily to avoid unbounded growth.
+    Keeps writing to the original filename; on a new UTC day it renames the previous
+    file to <stem>_YYYY-MM-DD.csv and starts a fresh file.
+    """
+    if not path.exists() or path.stat().st_size <= 0:
+        return
+    try:
+        mtime = path.stat().st_mtime
+    except Exception:
+        return
+    # Compare file's UTC day vs now UTC day
+    file_day = time.strftime("%Y-%m-%d", time.gmtime(mtime))
+    now_day = time.strftime("%Y-%m-%d", time.gmtime())
+    if file_day == now_day:
+        return
+    rotated = path.with_name(f"{path.stem}_{file_day}{path.suffix}")
+    try:
+        if not rotated.exists():
+            path.rename(rotated)
+    except Exception:
+        return
+
+
 def _append_row(path: Path, fieldnames: Iterable[str], row: Dict[str, Any]) -> None:
     _ensure_parent(path)
     fns = list(fieldnames)
+    _rotate_daily(path)
     _rotate_if_header_mismatch(path, fns)
     file_exists = path.exists() and path.stat().st_size > 0
     with path.open("a", newline="", encoding="utf-8") as f:

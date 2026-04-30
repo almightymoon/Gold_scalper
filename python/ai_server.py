@@ -116,67 +116,159 @@ class AiModel:
 def dummy_rule_ai(packet: Dict[str, Any]) -> Dict[str, Any]:
     f = packet.get("features", {}) or {}
 
+    def _hold(reason: str) -> Dict[str, Any]:
+        return {"signal": "HOLD", "confidence": 0.0, "sl_points": 0, "tp_points": 0, "reason": reason}
+
+    # Basic fields
+    bid = _safe_float(f, "bid")
+    ask = _safe_float(f, "ask")
+    spread_pts = float(_safe_int(f, "spread_points"))
+    hour = _safe_int(f, "hour_gmt")
+
+    # Session filter: avoid dead zone (late NY -> Asia)
+    in_dead_zone = (hour >= 21) or (hour < 6)
+    if in_dead_zone:
+        return _hold(f"dead_zone: hour_gmt={hour}")
+
+    # Hard spread gate for scalping (server-side prefilter; EA still enforces its own spread cap)
+    if spread_pts > 40:
+        return _hold(f"spread_too_wide: {spread_pts:.0f}")
+
+    # Volatility regime: use derived features if provided by features.py
+    ret_std = _safe_float(f, "m1_ret_std_20")
+    if np.isfinite(ret_std):
+        # Reject extremely flat or extreme spikes (heuristic)
+        if ret_std < 0.00005:
+            return _hold(f"volatility_too_low: ret_std_20={ret_std:.6f}")
+        if ret_std > 0.00150:
+            return _hold(f"volatility_too_high: ret_std_20={ret_std:.6f}")
+
+    # Trend/momentum inputs
     m1_ema9 = _safe_float(f, "m1_ema9")
     m1_ema21 = _safe_float(f, "m1_ema21")
+    m1_ema50 = _safe_float(f, "m1_ema50")
     m5_ema20 = _safe_float(f, "m5_ema20")
     m5_ema50 = _safe_float(f, "m5_ema50")
-    rsi = _safe_float(f, "m1_rsi14")
+    rsi1 = _safe_float(f, "m1_rsi14")
+    rsi5 = _safe_float(f, "m5_rsi14")
     adx = _safe_float(f, "m1_adx14")
-    spread_pts = float(_safe_int(f, "spread_points"))
+    plusdi = _safe_float(f, "m1_plusdi")
+    minusdi = _safe_float(f, "m1_minusdi")
 
-    is_buy = (m1_ema9 > m1_ema21) and (m5_ema20 > m5_ema50) and (45.0 <= rsi <= 68.0) and (adx > 12.0)
-    is_sell = (m1_ema9 < m1_ema21) and (m5_ema20 < m5_ema50) and (32.0 <= rsi <= 55.0) and (adx > 12.0)
+    # Last candle confirmation (use newest close: m1_c20_*)
+    o = _safe_float(f, "m1_c20_o")
+    h = _safe_float(f, "m1_c20_h")
+    l = _safe_float(f, "m1_c20_l")
+    c = _safe_float(f, "m1_c20_c")
+    rng = (h - l) if (np.isfinite(h) and np.isfinite(l) and (h - l) > 0) else np.nan
+    body_ratio = (abs(c - o) / rng) if np.isfinite(rng) else np.nan
+
+    def _score_buy() -> float:
+        score = 0.0
+        if m1_ema9 > m1_ema21:
+            score += 1.0
+        if m1_ema21 > m1_ema50:
+            score += 0.5
+        if m5_ema20 > m5_ema50:
+            score += 1.0
+        if 50.0 <= rsi1 <= 65.0:
+            score += 1.0
+        elif 45.0 <= rsi1 < 50.0:
+            score += 0.5
+        if adx > 25.0:
+            score += 1.5
+        elif adx > 15.0:
+            score += 0.75
+        if plusdi > minusdi:
+            score += 1.0
+        if rsi5 > 50.0:
+            score += 0.5
+        return score  # max ~6.5
+
+    def _score_sell() -> float:
+        score = 0.0
+        if m1_ema9 < m1_ema21:
+            score += 1.0
+        if m1_ema21 < m1_ema50:
+            score += 0.5
+        if m5_ema20 < m5_ema50:
+            score += 1.0
+        if 35.0 <= rsi1 <= 50.0:
+            score += 1.0
+        elif 50.0 < rsi1 <= 55.0:
+            score += 0.5
+        if adx > 25.0:
+            score += 1.5
+        elif adx > 15.0:
+            score += 0.75
+        if minusdi > plusdi:
+            score += 1.0
+        if rsi5 < 50.0:
+            score += 0.5
+        return score
+
+    buy_score = _score_buy()
+    sell_score = _score_sell()
+    MIN_SCORE = 4.5
 
     signal = "HOLD"
-    if is_buy and not is_sell:
-        signal = "BUY"
-    elif is_sell and not is_buy:
-        signal = "SELL"
+    score = 0.0
+    if buy_score >= MIN_SCORE and buy_score > sell_score + 0.5:
+        # Candle confirmation: bullish + decisive body
+        if np.isfinite(body_ratio) and (c > o) and (body_ratio >= 0.45):
+            signal = "BUY"
+            score = buy_score
+        else:
+            return _hold(f"candle_filter_buy: body_ratio={body_ratio:.2f}")
+    elif sell_score >= MIN_SCORE and sell_score > buy_score + 0.5:
+        if np.isfinite(body_ratio) and (c < o) and (body_ratio >= 0.45):
+            signal = "SELL"
+            score = sell_score
+        else:
+            return _hold(f"candle_filter_sell: body_ratio={body_ratio:.2f}")
 
-    # Confidence decomposition (0..1)
-    trend_align = 0.0
-    if signal == "BUY":
-        trend_align = float((m1_ema9 - m1_ema21) > 0) * 0.5 + float((m5_ema20 - m5_ema50) > 0) * 0.5
-    elif signal == "SELL":
-        trend_align = float((m1_ema9 - m1_ema21) < 0) * 0.5 + float((m5_ema20 - m5_ema50) < 0) * 0.5
-
-    adx_strength = _clamp((adx - 12.0) / 25.0, 0.0, 1.0)  # stronger above 12
-
-    if signal == "BUY":
-        rsi_quality = 1.0 - _clamp(abs(rsi - 56.0) / 14.0, 0.0, 1.0)
-    elif signal == "SELL":
-        rsi_quality = 1.0 - _clamp(abs(rsi - 44.0) / 14.0, 0.0, 1.0)
-    else:
-        rsi_quality = 0.3
-
-    # Spread penalty: ideal <= 25 pts; degrade after.
-    spread_quality = 1.0 - _clamp((spread_pts - 25.0) / 60.0, 0.0, 1.0)
-
-    base = 0.15
-    conf = base + 0.35 * trend_align + 0.25 * adx_strength + 0.20 * rsi_quality + 0.05 * spread_quality
     if signal == "HOLD":
-        conf = min(conf, 0.55)
-    conf = float(_clamp(conf, 0.0, 1.0))
+        return _hold(f"confluence_low: buy={buy_score:.2f} sell={sell_score:.2f} adx={adx:.1f} rsi={rsi1:.1f}")
 
-    # SL/TP points: conservative defaults for XAU scalping; EA will still validate stops/levels.
-    # Use ATR if present to scale slightly.
-    atr = _safe_float(f, "m1_atr14")
-    point = 0.01  # unknown on python side; treat as points already from EA-indicator context
-    atr_points_hint = 0.0
-    if np.isfinite(atr) and atr > 0:
-        atr_points_hint = atr / point
+    # Confidence: normalize score + add spread and session quality
+    spread_quality = 1.0 - _clamp((spread_pts - 18.0) / 40.0, 0.0, 1.0)
+    session_quality = 1.0
+    # Prefer London + overlap
+    if 7 <= hour < 12:
+        session_quality = 1.0
+    elif 12 <= hour < 16:
+        session_quality = 0.95
+    else:
+        session_quality = 0.80
 
-    sl_points = int(_clamp(120.0 + 0.10 * atr_points_hint, 80.0, 350.0))
-    tp_points = int(_clamp(sl_points * 1.4, 100.0, 600.0))
+    score_quality = _clamp((score - MIN_SCORE) / (6.5 - MIN_SCORE), 0.0, 1.0)
+    conf = float(_clamp(0.55 + 0.30 * score_quality + 0.10 * spread_quality + 0.05 * session_quality, 0.0, 1.0))
 
-    reason = f"dummy_rule_ai: {signal} (trend={trend_align:.2f}, adx={adx:.1f}, rsi={rsi:.1f}, spread={spread_pts:.0f})"
-    return {
-        "signal": signal,
-        "confidence": conf,
-        "sl_points": sl_points,
-        "tp_points": tp_points,
-        "reason": reason,
-    }
+    # ATR-based SL/TP (in points)
+    atr1 = _safe_float(f, "m1_atr14")
+    atr5 = _safe_float(f, "m5_atr14")
+    base_atr = atr5 if (np.isfinite(atr5) and atr5 > 0) else atr1
+
+    # Infer point size from bid/ask and spread_points (more robust on non-0.01 brokers)
+    point = 0.01
+    if np.isfinite(bid) and np.isfinite(ask) and spread_pts > 0:
+        inferred = (ask - bid) / spread_pts
+        if np.isfinite(inferred) and inferred > 0:
+            point = float(inferred)
+
+    if np.isfinite(base_atr) and base_atr > 0 and point > 0:
+        atr_pts = int(max(1, round(base_atr / point)))
+        sl_points = int(_clamp(atr_pts * 1.2, 80.0, 320.0))
+        tp_points = int(_clamp(atr_pts * 2.0, 150.0, 650.0))
+    else:
+        sl_points = 150
+        tp_points = 270
+
+    reason = (
+        f"confluence: {signal} score={score:.2f} buy={buy_score:.2f} sell={sell_score:.2f} "
+        f"adx={adx:.1f} rsi1={rsi1:.1f} body={body_ratio:.2f} spread={spread_pts:.0f} hour={hour}"
+    )
+    return {"signal": signal, "confidence": conf, "sl_points": sl_points, "tp_points": tp_points, "reason": reason}
 
 
 def decide(packet: Dict[str, Any], model: AiModel) -> Dict[str, Any]:
@@ -187,17 +279,25 @@ def decide(packet: Dict[str, Any], model: AiModel) -> Dict[str, Any]:
     rule = dummy_rule_ai(packet)
     p_win = model.predict_win_probability(packet)
     if p_win is None:
-        return rule
+        resp = rule
+    else:
+        p_win = float(_clamp(p_win, 0.0, 1.0))
+        base_conf = float(rule.get("confidence", 0.0) or 0.0)
+        # Combine: keep rule as baseline, then nudge by model probability.
+        combined = 0.55 * base_conf + 0.45 * p_win
+        rule["confidence"] = float(_clamp(combined, 0.0, 1.0))
+        rule["reason"] = f"model_pwin={p_win:.2f} combined_conf={rule['confidence']:.2f} | {rule.get('reason','')}"
+        if rule.get("signal") == "HOLD":
+            rule["confidence"] = min(rule["confidence"], 0.55)
+        resp = rule
 
-    p_win = float(_clamp(p_win, 0.0, 1.0))
-    base_conf = float(rule.get("confidence", 0.0) or 0.0)
-    # Combine: keep rule as baseline, then nudge by model probability.
-    combined = 0.55 * base_conf + 0.45 * p_win
-    rule["confidence"] = float(_clamp(combined, 0.0, 1.0))
-    rule["reason"] = f"model_pwin={p_win:.2f} combined_conf={rule['confidence']:.2f} | {rule.get('reason','')}"
-    if rule.get("signal") == "HOLD":
-        rule["confidence"] = min(rule["confidence"], 0.55)
-    return rule
+    # Server-side confidence filter (keeps MT5 risk controls intact)
+    MIN_CONF = 0.58
+    if resp.get("signal") in {"BUY", "SELL"} and float(resp.get("confidence", 0.0) or 0.0) < MIN_CONF:
+        resp["reason"] = f"filtered: conf={float(resp.get('confidence',0.0)):.2f} < {MIN_CONF:.2f} | {resp.get('reason','')}"
+        resp["signal"] = "HOLD"
+        resp["confidence"] = min(float(resp.get("confidence", 0.0) or 0.0), 0.55)
+    return resp
 
 
 def _handle_packet(

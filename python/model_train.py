@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import TimeSeriesSplit
 
 from features import select_model_features
 from features import packet_to_dataframe_row
@@ -252,6 +252,24 @@ def train(paths: Paths, *, horizon_rows: int, point_value: float) -> None:
     print(f"Precision: {prec:.4f}")
     print(f"Recall   : {rec:.4f}")
     print(f"F1       : {f1:.4f}")
+
+    # Walk-forward validation (optional but recommended signal)
+    if len(X) >= 40:
+        n_splits = 5
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        wf_scores = []
+        for tr_idx, te_idx in tscv.split(X):
+            m = RandomForestClassifier(
+                n_estimators=450,
+                max_depth=10,
+                min_samples_leaf=10,
+                random_state=42,
+                class_weight="balanced_subsample",
+                n_jobs=-1,
+            )
+            m.fit(X.iloc[tr_idx], y.iloc[tr_idx])
+            wf_scores.append(accuracy_score(y.iloc[te_idx], m.predict(X.iloc[te_idx])))
+        print(f"Walk-forward accuracy: {float(np.mean(wf_scores)):.4f} ± {float(np.std(wf_scores)):.4f} (n_splits={n_splits})")
 
     paths.models_dir.mkdir(parents=True, exist_ok=True)
     out = {
