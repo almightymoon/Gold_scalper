@@ -4,7 +4,7 @@
 //| Demo/backtest-first; MT5 enforces all risk protection            |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.00"
+#property version   "1.05"
 #property description "GoldScalper AI Bridge: MT5 EA sends features to Python, receives BUY/SELL/HOLD with confidence/SL/TP."
 
 #include <Trade/Trade.mqh>
@@ -422,11 +422,10 @@ bool FileBridgeRequest(const string req_json, const string request_id, string &r
    {
       if(FileIsExist(resp_path, FILE_COMMON))
       {
-         int hr = FileOpen(resp_path, FILE_READ|FILE_TXT|FILE_COMMON);
-         if(hr != INVALID_HANDLE)
+         string tmp = "";
+         if(ReadAllFileCommonUtf8(resp_path, tmp))
          {
-            resp_json = FileReadString(hr);
-            FileClose(hr);
+            resp_json = tmp;
             if(StringLen(resp_json) > 0)
             {
                string rid = "";
@@ -461,6 +460,65 @@ bool InitCommonSubdir()
    }
    // Flat fallback (no subfolder)
    return false;
+}
+
+bool ReadAllTextFileCommon(const string rel_path, string &out)
+{
+   out = "";
+   if(!FileIsExist(rel_path, FILE_COMMON))
+      return false;
+   int h = FileOpen(rel_path, FILE_READ|FILE_TXT|FILE_COMMON);
+   if(h == INVALID_HANDLE)
+      return false;
+   int sz = (int)FileSize(h);
+   if(sz <= 0)
+   {
+      FileClose(h);
+      return false;
+   }
+   // Read the entire file; FileReadString() without length tokenizes by whitespace.
+   out = FileReadString(h, sz);
+   FileClose(h);
+   return (StringLen(out) > 0);
+}
+
+bool ReadAllFileCommonUtf8(const string rel_path, string &out)
+{
+   out = "";
+   if(!FileIsExist(rel_path, FILE_COMMON))
+      return false;
+   int h = FileOpen(rel_path, FILE_READ|FILE_BIN|FILE_COMMON);
+   if(h == INVALID_HANDLE)
+      return false;
+   int sz = (int)FileSize(h);
+   if(sz <= 0)
+   {
+      FileClose(h);
+      return false;
+   }
+   uchar buf[];
+   ArrayResize(buf, sz);
+   int n = FileReadArray(h, buf, 0, sz);
+   FileClose(h);
+   if(n <= 0)
+      return false;
+   out = CharArrayToString(buf, 0, n, CP_UTF8);
+   return (StringLen(out) > 0);
+}
+
+bool TryReadResponseStampEpoch(double &out_epoch)
+{
+   out_epoch = 0.0;
+   string stamp_path = CommonRelPath(g_stamp_file);
+   string s = "";
+   if(!ReadAllFileCommonUtf8(stamp_path, s))
+      return false;
+   if(StringLen(s) <= 0)
+      return false;
+   out_epoch = StringToDouble(s);
+   if(out_epoch <= 0.0)
+      return false;
+   return true;
 }
 
 // -------------------- JSON response parsing --------------------
@@ -1042,6 +1100,32 @@ void UpdateDashboard()
    string loss_msg="";
    bool loss_hit = DailyLossHit(loss_msg);
 
+   // Connection status UX:
+   // The one-time OnInit() ping can fail if Python wasn't running yet.
+   // Use last successful AI reply (or file response stamp) to reflect actual connectivity.
+   if(g_conn_status != "FEATURES_ERROR")
+   {
+      bool connected = false;
+      if(g_last_ai_time > 0 && (TimeCurrent() - g_last_ai_time) <= 90)
+         connected = true;
+      // File-bridge: if Python writes response.stamp recently, consider it connected even if
+      // this chart hasn't processed a new-bar cycle yet.
+      if(!connected && InpUseFileFallback)
+      {
+         double stamp_epoch = 0.0;
+         if(TryReadResponseStampEpoch(stamp_epoch))
+         {
+            // response.stamp is written as a Unix epoch (UTC seconds).
+            // Use TimeGMT() so we compare in the same time base.
+            datetime now_utc = TimeGMT();
+            datetime stamp_dt = (datetime)MathRound(stamp_epoch);
+            if(stamp_dt > 0 && (now_utc - stamp_dt) <= 180)
+               connected = true;
+         }
+      }
+      g_conn_status = (connected ? "CONNECTED" : "DISCONNECTED");
+   }
+
    string txt =
       "GoldScalper_AI_Bridge\n"
       "Symbol: " + sym + (SymbolLooksLikeGold(sym) ? "" : " (not XAU?)") + "\n"
@@ -1114,6 +1198,7 @@ bool IsNewM1Bar()
 // -------------------- Lifecycle --------------------
 int OnInit()
 {
+   Print("GoldScalper_AI_Bridge init (v1.05) conn-status fix active.");
    if(!SymbolLooksLikeGold(_Symbol))
       Print("Warning: attached to symbol=", _Symbol, " (expected XAUUSD/GOLD variants). EA will still run.");
 
@@ -1184,6 +1269,7 @@ void OnTick()
       if(!BuildFeaturesJson(req_json))
       {
          g_conn_status = "FEATURES_ERROR";
+         g_last_ping = "FAIL: features_build";
          UpdateDashboard();
          return;
       }
@@ -1208,6 +1294,7 @@ void OnTick()
       if(!ok)
       {
          g_conn_status = "DISCONNECTED";
+         g_last_ping = "FAIL: " + err;
          g_last_signal = "HOLD";
          g_last_confidence = 0.0;
          g_last_reason = "no_ai_response: " + err;
@@ -1220,6 +1307,7 @@ void OnTick()
       }
 
       g_conn_status = "CONNECTED";
+      g_last_ping = "OK";
       string sig, rsn;
       double conf;
       int sl_pts, tp_pts;
@@ -1308,4 +1396,5 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
       FileClose(h);
    }
 }
+
 
