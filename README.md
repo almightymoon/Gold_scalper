@@ -75,3 +75,12 @@ python3 model_train.py
 
 If a model is saved to `python/models/model.pkl`, the server will load it on startup and use it when available.
 
+## Smoke test commands
+
+```bash
+pip install -r python/requirements.txt
+python -m py_compile python/*.py
+python python/ai_server.py --file-bridge --file-bridge-dir "<MT5_COMMON_FILES_BRIDGE_DIR>"
+```
+
+  

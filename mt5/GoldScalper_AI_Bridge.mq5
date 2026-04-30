@@ -7,7 +7,7 @@
 #property version   "1.05"
 #property description "GoldScalper AI Bridge: MT5 EA sends features to Python, receives BUY/SELL/HOLD with confidence/SL/TP."
 
-#include <Trade/Trade.mqh>
+#include <Trade\Trade.mqh>
 
 // -------------------- Inputs --------------------
 input long   InpMagicNumber            = 24043001;

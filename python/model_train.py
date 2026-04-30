@@ -226,11 +226,24 @@ def train(paths: Paths, *, horizon_rows: int, point_value: float) -> None:
     X, feature_cols = select_model_features(Xraw)
     X = X.fillna(0.0)
 
+    # Prefer a time-based split, but don't hard-fail on small datasets.
+    # When data is scarce, train on all labeled samples and still write model.pkl so the
+    # live server can run (confidence overlay will be weak until more data is collected).
     split = int(len(X) * 0.75)
-    if split <= 10 or (len(X) - split) <= 5:
-        raise RuntimeError("Not enough labeled samples for a time-based split. Collect more data.")
-    X_train, X_test = X.iloc[:split], X.iloc[split:]
-    y_train, y_test = y.iloc[:split], y.iloc[split:]
+    min_train = 15
+    min_test = 6
+    use_holdout = (split >= min_train) and ((len(X) - split) >= min_test)
+    if use_holdout:
+        X_train, X_test = X.iloc[:split], X.iloc[split:]
+        y_train, y_test = y.iloc[:split], y.iloc[split:]
+    else:
+        X_train, y_train = X, y
+        X_test, y_test = None, None
+        print(
+            "WARNING: Not enough labeled samples for a time-based split "
+            f"(samples={len(X)} train={split} test={len(X)-split}). "
+            "Training on ALL data; collect more data for proper validation."
+        )
 
     clf = RandomForestClassifier(
         n_estimators=450,
@@ -242,19 +255,23 @@ def train(paths: Paths, *, horizon_rows: int, point_value: float) -> None:
     )
     clf.fit(X_train, y_train)
 
-    y_pred = clf.predict(X_test)
-    acc = accuracy_score(y_test, y_pred)
-    prec, rec, f1, _ = precision_recall_fscore_support(y_test, y_pred, average="binary", zero_division=0)
+    if X_test is not None and y_test is not None:
+        y_pred = clf.predict(X_test)
+        acc = accuracy_score(y_test, y_pred)
+        prec, rec, f1, _ = precision_recall_fscore_support(y_test, y_pred, average="binary", zero_division=0)
 
-    print("=== Model metrics (binary: TP-before-SL) ===")
-    print(f"Samples: {len(y)} (train={len(y_train)}, test={len(y_test)})")
-    print(f"Accuracy : {acc:.4f}")
-    print(f"Precision: {prec:.4f}")
-    print(f"Recall   : {rec:.4f}")
-    print(f"F1       : {f1:.4f}")
+        print("=== Model metrics (binary: TP-before-SL) ===")
+        print(f"Samples: {len(y)} (train={len(y_train)}, test={len(y_test)})")
+        print(f"Accuracy : {acc:.4f}")
+        print(f"Precision: {prec:.4f}")
+        print(f"Recall   : {rec:.4f}")
+        print(f"F1       : {f1:.4f}")
+    else:
+        print("=== Model metrics ===")
+        print(f"Samples: {len(y)} (trained on all; no holdout metrics)")
 
     # Walk-forward validation (optional but recommended signal)
-    if len(X) >= 40:
+    if X_test is not None and len(X) >= 40:
         n_splits = 5
         tscv = TimeSeriesSplit(n_splits=n_splits)
         wf_scores = []
@@ -279,6 +296,8 @@ def train(paths: Paths, *, horizon_rows: int, point_value: float) -> None:
             "horizon_rows": horizon_rows,
             "point_value": point_value,
             "note": "Model predicts success probability; server still enforces safe SL/TP defaults.",
+            "trained_with_holdout": bool(X_test is not None),
+            "n_samples": int(len(y)),
         },
     }
     joblib.dump(out, paths.models_dir / "model.pkl")
