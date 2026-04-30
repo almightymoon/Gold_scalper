@@ -1,0 +1,6 @@
+pyzmq
+pandas
+numpy
+scikit-learn
+joblib
+
