@@ -11,16 +11,29 @@
 // -----------------------------------
 input int    MagicNumber          = 20260501;
 input double RiskPercent          = 0.5;     // present per requirements (not used for lot sizing)
-input int    TP_Points            = 25;
-input int    SL_Points            = 50;
-input int    MaxTrades            = 3;
+input int    TP_Points            = 25;     // TP1
+input int    TP2_Points           = 60;     // TP2 (runner)
+input int    SL_Points            = 120;    // wider initial SL to avoid early whipsaw
+input bool   EnableTP2            = true;
+input double TP1_PartialClosePct  = 60.0;   // close this % at TP1, keep rest for TP2 (0 disables)
+input int    BreakEvenAfterPts    = 20;     // once in profit by this many points, move SL to entry
+input int    BreakEvenPlusPts     = 2;      // extra points beyond entry when moving to BE
+input int    TrailStartPts        = 35;     // start trailing after this profit (points)
+input int    TrailDistancePts     = 20;     // keep SL this far behind price (points)
+input int    MaxTrades            = 5;      // total concurrent positions this EA may hold
+input int    TypicalEntriesPerSignal = 5;   // desired stack size on strong signals (capped by MaxTrades)
+input int    MinEntriesPerSignal  = 1;      // weak signals still take at least 1 trade
+input double StrongRsiBoost       = 6.0;    // extra RSI distance beyond threshold to scale up entries
+input int    StrongEmaGapPoints   = 25;     // EMA gap (points) to scale up entries
 input int    SpreadLimit          = 60; // Gold often exceeds 60 pts on demo; raise if chart shows spread BLOCKED
 input int    MaxLossStreak        = 3;
 input double MaxDailyLossPercent  = 5.0;
 input int    CooldownSeconds      = 5;
 input bool   EnableTradeLog       = true;
-input bool   TradeLogToCommonFolder = false; // true = Common\\Files (shared); false = this terminal MQL5\\Files (Open Data Folder)
+input bool   TradeLogToCommonFolder = true; // true = Common\\Files (shared, easiest for python); false = this terminal MQL5\\Files (Open Data Folder)
 input string TradeLogCsv          = "trades_aggressive_v3.csv";
+input bool   EnableMlLog          = true;
+input string MlLogCsv             = "trades_aggressive_v3_ml.csv"; // ML-ready log with indicators + position_id
 
 // -----------------------------------
 // GLOBALS
@@ -71,6 +84,14 @@ string TradeLogResolvedHint()
    return root + "\\MQL5\\Files\\" + TradeLogCsv + "  -> MT5: File -> Open Data Folder -> MQL5 -> Files";
 }
 
+string LogResolvedHintFor(const string filename)
+{
+   if(TradeLogToCommonFolder)
+      return "[COMMON] Files\\" + filename + "  -> MT5: File -> Open Common Data Folder -> Files";
+   string root = TerminalInfoString(TERMINAL_DATA_PATH);
+   return root + "\\MQL5\\Files\\" + filename + "  -> MT5: File -> Open Data Folder -> MQL5 -> Files";
+}
+
 bool WriteCSVHeaderIfNeeded(const string csv_file, const string header_line)
 {
    int h = FileOpen(csv_file, FILE_READ|FILE_WRITE|FILE_CSV|TradeLogDiskFlags(), ',');
@@ -109,6 +130,50 @@ void LogTradeEvent(const string iso_time, const string sym, const string event, 
    FileSeek(h, 0, SEEK_END);
    string line = StringFormat("%s,%s,%s,%s,%.2f,%.5f,%.5f,%.5f,%.2f,%s\n",
                               iso_time, sym, event, side, volume, price, sl, tp, profit, CsvEscape(reason));
+   FileWriteString(h, line);
+   FileClose(h);
+}
+
+bool WriteMlHeaderIfNeeded()
+{
+   if(!EnableMlLog) return false;
+   return WriteCSVHeaderIfNeeded(
+      MlLogCsv,
+      "time,symbol,event,position_id,deal_id,side,volume,price,sl,tp,ema9,ema21,rsi,spread_pts,profit,reason\n"
+   );
+}
+
+void LogMlEvent(
+   const string iso_time,
+   const string sym,
+   const string event,
+   const long position_id,
+   const long deal_id,
+   const string side,
+   const double volume,
+   const double price,
+   const double sl,
+   const double tp,
+   const double ema9,
+   const double ema21,
+   const double rsi,
+   const int spread_pts,
+   const double profit,
+   const string reason
+)
+{
+   if(!EnableMlLog) return;
+   if(!WriteMlHeaderIfNeeded())
+      return;
+   int h = FileOpen(MlLogCsv, FILE_READ|FILE_WRITE|FILE_TXT|TradeLogDiskFlags());
+   if(h == INVALID_HANDLE) return;
+   FileSeek(h, 0, SEEK_END);
+   string line = StringFormat(
+      "%s,%s,%s,%I64d,%I64d,%s,%.2f,%.5f,%.5f,%.5f,%.5f,%.5f,%.2f,%d,%.2f,%s\n",
+      iso_time, sym, event,
+      (long)position_id, (long)deal_id,
+      side, volume, price, sl, tp, ema9, ema21, rsi, spread_pts, profit, CsvEscape(reason)
+   );
    FileWriteString(h, line);
    FileClose(h);
 }
@@ -278,6 +343,157 @@ bool DailyLossOk(double &out_loss_percent)
    return (out_loss_percent < MaxDailyLossPercent);
 }
 
+bool ModifyPositionSLTP(const ulong ticket, const double new_sl, const double new_tp)
+{
+   if(ticket == 0)
+      return false;
+   MqlTradeRequest req;
+   MqlTradeResult  res;
+   ZeroMemory(req);
+   ZeroMemory(res);
+
+   req.action   = TRADE_ACTION_SLTP;
+   req.position = ticket;
+   req.symbol   = _Symbol;
+   req.magic    = MagicNumber;
+   req.sl       = new_sl;
+   req.tp       = new_tp;
+
+   if(!OrderSend(req, res))
+      return false;
+   return (res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_DONE_PARTIAL);
+}
+
+double PointsProfitForPosition(const long type, const double open_price, const double bid, const double ask)
+{
+   if(_Point <= 0.0)
+      return 0.0;
+   // For BUY profit measured from bid; for SELL from ask
+   if(type == POSITION_TYPE_BUY)
+      return (bid - open_price) / _Point;
+   if(type == POSITION_TYPE_SELL)
+      return (open_price - ask) / _Point;
+   return 0.0;
+}
+
+string GV_TP1DoneName(const ulong ticket)
+{
+   return "GSA3_TP1DONE_" + (string)MagicNumber + "_" + (string)ticket;
+}
+
+bool IsTP1Done(const ulong ticket)
+{
+   string n = GV_TP1DoneName(ticket);
+   return GlobalVariableCheck(n) && GlobalVariableGet(n) > 0.5;
+}
+
+void MarkTP1Done(const ulong ticket)
+{
+   GlobalVariableSet(GV_TP1DoneName(ticket), 1.0);
+}
+
+void ManageOpenPositions()
+{
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
+   double vmin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double vstep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(vstep <= 0.0) vstep = 0.01;
+
+   int total = PositionsTotal();
+   for(int i = total - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if((int)PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+
+      long type = (long)PositionGetInteger(POSITION_TYPE);
+      double vol = PositionGetDouble(POSITION_VOLUME);
+      double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl = PositionGetDouble(POSITION_SL);
+      double tp = PositionGetDouble(POSITION_TP);
+
+      double profitPts = PointsProfitForPosition(type, open_price, bid, ask);
+
+      // TP1 partial close
+      if(TP1_PartialClosePct > 0.0 && TP1_PartialClosePct < 100.0 && profitPts >= (double)TP_Points && !IsTP1Done(ticket))
+      {
+         double closeVol = NormalizeVolume(vol * (TP1_PartialClosePct / 100.0));
+         // ensure we don't try to close below min step
+         if(closeVol >= vmin + 1e-12 && closeVol < vol - 1e-12)
+         {
+            bool ok = trade.PositionClosePartial(ticket, closeVol);
+            if(ok)
+            {
+               MarkTP1Done(ticket);
+               Print("TP1 partial close ticket=", (string)ticket, " closeVol=", DoubleToString(closeVol, 2));
+            }
+            else
+            {
+               Print("TP1 partial close failed ticket=", (string)ticket, " retcode=", (int)trade.ResultRetcode(), " desc=", trade.ResultRetcodeDescription());
+            }
+         }
+         else
+         {
+            // Can't partial-close cleanly (too small), mark done to avoid spam.
+            MarkTP1Done(ticket);
+         }
+      }
+
+      // Break-even move
+      if(BreakEvenAfterPts > 0 && profitPts >= (double)BreakEvenAfterPts)
+      {
+         double be = open_price;
+         if(type == POSITION_TYPE_BUY)  be = open_price + BreakEvenPlusPts * _Point;
+         if(type == POSITION_TYPE_SELL) be = open_price - BreakEvenPlusPts * _Point;
+         be = NormalizeDouble(be, digits);
+
+         bool shouldMove = false;
+         if(type == POSITION_TYPE_BUY && (sl <= 0.0 || sl < be - (_Point * 0.5))) shouldMove = true;
+         if(type == POSITION_TYPE_SELL && (sl <= 0.0 || sl > be + (_Point * 0.5))) shouldMove = true;
+
+         if(shouldMove)
+         {
+            double newTp = tp;
+            // If TP2 enabled, keep TP at TP2 target. If disabled, keep whatever TP is set.
+            if(EnableTP2)
+            {
+               if(type == POSITION_TYPE_BUY)  newTp = NormalizeDouble(open_price + TP2_Points * _Point, digits);
+               if(type == POSITION_TYPE_SELL) newTp = NormalizeDouble(open_price - TP2_Points * _Point, digits);
+            }
+            ModifyPositionSLTP(ticket, be, newTp);
+         }
+      }
+
+      // Trailing stop (tighten once in profit)
+      if(TrailStartPts > 0 && TrailDistancePts > 0 && profitPts >= (double)TrailStartPts)
+      {
+         double trail = 0.0;
+         if(type == POSITION_TYPE_BUY)  trail = NormalizeDouble(bid - TrailDistancePts * _Point, digits);
+         if(type == POSITION_TYPE_SELL) trail = NormalizeDouble(ask + TrailDistancePts * _Point, digits);
+
+         bool shouldTrail = false;
+         if(type == POSITION_TYPE_BUY && (sl <= 0.0 || trail > sl + (_Point * 0.5))) shouldTrail = true;
+         if(type == POSITION_TYPE_SELL && (sl <= 0.0 || trail < sl - (_Point * 0.5))) shouldTrail = true;
+
+         if(shouldTrail)
+         {
+            double newTp = tp;
+            if(EnableTP2)
+            {
+               if(type == POSITION_TYPE_BUY)  newTp = NormalizeDouble(open_price + TP2_Points * _Point, digits);
+               if(type == POSITION_TYPE_SELL) newTp = NormalizeDouble(open_price - TP2_Points * _Point, digits);
+            }
+            ModifyPositionSLTP(ticket, trail, newTp);
+         }
+      }
+   }
+}
+
 bool CopyValue(int handle, int buffer, int shift, double &out)
 {
    out = 0.0;
@@ -291,18 +507,20 @@ bool CopyValue(int handle, int buffer, int shift, double &out)
    return true;
 }
 
-int GetSignal()
+bool GetSignalAndStrength(int &out_sig, int &out_entries)
 {
    // Use CLOSED candle (shift=1) for candle direction and indicator reads
    double ema9 = 0.0, ema21 = 0.0, rsi = 0.0;
-   if(!CopyValue(hEma9, 0, 1, ema9))  return 0;
-   if(!CopyValue(hEma21, 0, 1, ema21)) return 0;
-   if(!CopyValue(hRsi14, 0, 1, rsi))  return 0;
+   out_sig = 0;
+   out_entries = MinEntriesPerSignal;
+   if(!CopyValue(hEma9, 0, 1, ema9))  return false;
+   if(!CopyValue(hEma21, 0, 1, ema21)) return false;
+   if(!CopyValue(hRsi14, 0, 1, rsi))  return false;
 
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
    if(CopyRates(_Symbol, PERIOD_M1, 1, 2, rates) < 2)
-      return 0;
+      return false;
 
    double lastOpen  = rates[0].open;
    double lastClose = rates[0].close;
@@ -311,15 +529,42 @@ int GetSignal()
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double mid = (bid + ask) * 0.5;
 
+   // Strength heuristics (how far beyond thresholds we are).
+   double emaGapPts = 0.0;
+   if(_Point > 0.0)
+      emaGapPts = MathAbs(ema9 - ema21) / _Point;
+
    // BUY conditions
    if(ema9 > ema21 && mid > ema9 && lastClose > lastOpen && rsi > 52.0)
-      return 1;
+   {
+      out_sig = 1;
+      double rsiBoost = MathMax(0.0, rsi - 52.0);
+      int n = MinEntriesPerSignal;
+      if(rsiBoost >= StrongRsiBoost) n++;
+      if(emaGapPts >= (double)StrongEmaGapPoints) n++;
+      if(rsiBoost >= StrongRsiBoost * 2.0) n++;
+      if(emaGapPts >= (double)StrongEmaGapPoints * 2.0) n++;
+      out_entries = (int)MathMax(MinEntriesPerSignal, MathMin((double)TypicalEntriesPerSignal, (double)n));
+      return true;
+   }
 
    // SELL conditions
    if(ema9 < ema21 && mid < ema9 && lastClose < lastOpen && rsi < 48.0)
-      return -1;
+   {
+      out_sig = -1;
+      double rsiBoost = MathMax(0.0, 48.0 - rsi);
+      int n = MinEntriesPerSignal;
+      if(rsiBoost >= StrongRsiBoost) n++;
+      if(emaGapPts >= (double)StrongEmaGapPoints) n++;
+      if(rsiBoost >= StrongRsiBoost * 2.0) n++;
+      if(emaGapPts >= (double)StrongEmaGapPoints * 2.0) n++;
+      out_entries = (int)MathMax(MinEntriesPerSignal, MathMin((double)TypicalEntriesPerSignal, (double)n));
+      return true;
+   }
 
-   return 0;
+   out_sig = 0;
+   out_entries = MinEntriesPerSignal;
+   return true;
 }
 
 void UpdateLossTracking()
@@ -373,12 +618,21 @@ void UpdateLossTracking()
    lastCheck = now;
 }
 
-void OpenTrade(const int signal)
+void OpenTradeOnce(const int signal)
 {
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    string iso_time = ToISO(TimeGMT());
+   int spreadPts = 0;
+   if(_Point > 0.0)
+      spreadPts = (int)MathRound((ask - bid) / _Point);
+
+   // Snapshot indicators used for the decision (closed candle)
+   double ema9 = 0.0, ema21 = 0.0, rsi = 0.0;
+   CopyValue(hEma9, 0, 1, ema9);
+   CopyValue(hEma21, 0, 1, ema21);
+   CopyValue(hRsi14, 0, 1, rsi);
 
    if(_Point <= 0.0)
       return;
@@ -396,7 +650,7 @@ void OpenTrade(const int signal)
          return;
       }
       double sl = NormalizeDouble(ask - SL_Points * _Point, digits);
-      double tp = NormalizeDouble(ask + TP_Points * _Point, digits);
+      double tp = NormalizeDouble(ask + (EnableTP2 ? TP2_Points : TP_Points) * _Point, digits);
       bool ok = trade.Buy(vol, _Symbol, ask, sl, tp, "Aggressive_v3");
       if(ok)
       {
@@ -404,12 +658,18 @@ void OpenTrade(const int signal)
          g_status_line = "BUY opened OK";
          Print("BUY opened vol=", DoubleToString(vol, 2), " SLpts=", SL_Points, " TPpts=", TP_Points);
          LogTradeEvent(iso_time, _Symbol, "OPEN", "BUY", vol, ask, sl, tp, 0.0, "opened");
+         long deal_id = (long)trade.ResultDeal();
+         long pos_id = 0;
+         if(deal_id > 0 && HistoryDealSelect((ulong)deal_id))
+            pos_id = (long)HistoryDealGetInteger((ulong)deal_id, DEAL_POSITION_ID);
+         LogMlEvent(iso_time, _Symbol, "OPEN", pos_id, deal_id, "BUY", vol, ask, sl, tp, ema9, ema21, rsi, spreadPts, 0.0, "opened");
       }
       else
       {
          g_status_line = "BUY failed: " + trade.ResultRetcodeDescription();
          Print("BUY failed retcode=", (int)trade.ResultRetcode(), " desc=", trade.ResultRetcodeDescription());
          LogTradeEvent(iso_time, _Symbol, "OPEN_FAIL", "BUY", vol, ask, sl, tp, 0.0, trade.ResultRetcodeDescription());
+         LogMlEvent(iso_time, _Symbol, "OPEN_FAIL", 0, (long)trade.ResultDeal(), "BUY", vol, ask, sl, tp, ema9, ema21, rsi, spreadPts, 0.0, trade.ResultRetcodeDescription());
       }
       return;
    }
@@ -427,7 +687,7 @@ void OpenTrade(const int signal)
          return;
       }
       double sl = NormalizeDouble(bid + SL_Points * _Point, digits);
-      double tp = NormalizeDouble(bid - TP_Points * _Point, digits);
+      double tp = NormalizeDouble(bid - (EnableTP2 ? TP2_Points : TP_Points) * _Point, digits);
       bool ok = trade.Sell(vol, _Symbol, bid, sl, tp, "Aggressive_v3");
       if(ok)
       {
@@ -435,15 +695,29 @@ void OpenTrade(const int signal)
          g_status_line = "SELL opened OK";
          Print("SELL opened vol=", DoubleToString(vol, 2), " SLpts=", SL_Points, " TPpts=", TP_Points);
          LogTradeEvent(iso_time, _Symbol, "OPEN", "SELL", vol, bid, sl, tp, 0.0, "opened");
+         long deal_id = (long)trade.ResultDeal();
+         long pos_id = 0;
+         if(deal_id > 0 && HistoryDealSelect((ulong)deal_id))
+            pos_id = (long)HistoryDealGetInteger((ulong)deal_id, DEAL_POSITION_ID);
+         LogMlEvent(iso_time, _Symbol, "OPEN", pos_id, deal_id, "SELL", vol, bid, sl, tp, ema9, ema21, rsi, spreadPts, 0.0, "opened");
       }
       else
       {
          g_status_line = "SELL failed: " + trade.ResultRetcodeDescription();
          Print("SELL failed retcode=", (int)trade.ResultRetcode(), " desc=", trade.ResultRetcodeDescription());
          LogTradeEvent(iso_time, _Symbol, "OPEN_FAIL", "SELL", vol, bid, sl, tp, 0.0, trade.ResultRetcodeDescription());
+         LogMlEvent(iso_time, _Symbol, "OPEN_FAIL", 0, (long)trade.ResultDeal(), "SELL", vol, bid, sl, tp, ema9, ema21, rsi, spreadPts, 0.0, trade.ResultRetcodeDescription());
       }
       return;
    }
+}
+
+void OpenTrades(const int signal, const int count)
+{
+   int n = count;
+   if(n < 1) n = 1;
+   for(int i = 0; i < n; i++)
+      OpenTradeOnce(signal);
 }
 
 //+------------------------------------------------------------------+
@@ -476,6 +750,13 @@ int OnInit()
       else
          Print("Trade log (repo data/ is NOT used — MT5 folder only): ", TradeLogResolvedHint());
    }
+   if(EnableMlLog)
+   {
+      if(!WriteMlHeaderIfNeeded())
+         Print("ML log: FAILED to create ", MlLogCsv, " err=", GetLastError());
+      else
+         Print("ML log (for training): ", LogResolvedHintFor(MlLogCsv));
+   }
    return INIT_SUCCEEDED;
 }
 
@@ -489,6 +770,9 @@ void OnDeinit(const int reason)
 
 void OnTick()
 {
+   // Manage existing positions every tick (BE / trailing / TP1 partial).
+   ManageOpenPositions();
+
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    int spreadPts = 0;
@@ -550,7 +834,15 @@ void OnTick()
       return;
    }
 
-   int sig = GetSignal();
+   int sig = 0;
+   int desiredEntries = MinEntriesPerSignal;
+   if(!GetSignalAndStrength(sig, desiredEntries))
+   {
+      g_status_line = "SKIP: indicator read failed";
+      Print("Skip: indicator read failed err=", GetLastError());
+      UpdateChartComment(spreadPts);
+      return;
+   }
    if(sig == 0)
    {
       g_status_line = "SKIP: no EMA/RSI signal this bar";
@@ -559,9 +851,12 @@ void OnTick()
       return;
    }
 
-   g_status_line = (sig == 1 ? "Opening BUY..." : "Opening SELL...");
+   int openNow = CountTrades();
+   int room = MaxTrades - openNow;
+   int nOpen = (int)MathMax(1.0, MathMin((double)room, (double)desiredEntries));
+   g_status_line = (sig == 1 ? "Signal BUY: opening " : "Signal SELL: opening ") + (string)nOpen + " / " + (string)desiredEntries;
    UpdateChartComment(spreadPts);
-   OpenTrade(sig);
+   OpenTrades(sig, nOpen);
    UpdateChartComment(spreadPts);
 }
 
@@ -597,5 +892,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
 
    string iso_time = ToISO(TimeGMT());
    LogTradeEvent(iso_time, sym, "CLOSE", side, volume, price, 0.0, 0.0, (profit + commission + swap), "deal_close");
+
+   // ML close row (match by position_id)
+   long pos_id = (long)HistoryDealGetInteger(deal, DEAL_POSITION_ID);
+   LogMlEvent(iso_time, sym, "CLOSE", pos_id, (long)deal, side, volume, price, 0.0, 0.0, 0.0, 0.0, 0.0, 0, (profit + commission + swap), "deal_close");
 }
 

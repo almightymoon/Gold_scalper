@@ -569,64 +569,167 @@ def _tail_csv_rows_incremental(
         prev_offset = 0
 
     rows: list[dict[str, str]] = []
+
+    def _detect_encoding(sample: bytes) -> str:
+        # BOM-based detection first
+        if sample.startswith(b"\xff\xfe"):
+            return "utf-16-le"
+        if sample.startswith(b"\xfe\xff"):
+            return "utf-16-be"
+        if sample.startswith(b"\xef\xbb\xbf"):
+            return "utf-8-sig"
+        # Heuristic: MT5 on Windows/Wine often writes UTF-16LE without BOM.
+        if sample.count(b"\x00") > max(8, len(sample) // 10):
+            return "utf-16-le"
+        return "utf-8"
+
     try:
-        with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+        # Read as bytes so we can handle UTF-16 (null bytes) reliably.
+        with path.open("rb") as f:
             if prev_offset > 0:
                 f.seek(prev_offset)
-            # If starting at 0, consume header line if present.
-            if prev_offset == 0:
-                _ = f.readline()
-            # Read remaining new lines.
-            for line in f:
-                line = line.strip("\n\r")
-                if not line:
-                    continue
-                # We expect: time,symbol,event,side,volume,price,sl,tp,profit,reason
-                parts = []
-                cur = ""
-                in_quotes = False
-                i = 0
-                while i < len(line):
-                    ch = line[i]
-                    if ch == '"' and (i + 1 < len(line) and line[i + 1] == '"'):
-                        cur += '"'
-                        i += 2
-                        continue
-                    if ch == '"':
-                        in_quotes = not in_quotes
-                        i += 1
-                        continue
-                    if ch == "," and not in_quotes:
-                        parts.append(cur)
-                        cur = ""
-                        i += 1
-                        continue
-                    cur += ch
-                    i += 1
-                parts.append(cur)
-                if len(parts) < 10:
-                    continue
-                rows.append(
-                    {
-                        "time": parts[0],
-                        "symbol": parts[1],
-                        "event": parts[2],
-                        "side": parts[3],
-                        "volume": parts[4],
-                        "price": parts[5],
-                        "sl": parts[6],
-                        "tp": parts[7],
-                        "profit": parts[8],
-                        "reason": parts[9],
-                    }
-                )
+            else:
+                # Establish encoding on first read.
+                sample = f.read(4096)
+                enc = _detect_encoding(sample)
+                state["encoding"] = enc
+                # Reset to start for full parse.
+                f.seek(0)
+
+            enc = str(state.get("encoding") or "utf-8")
+            carry: bytes = state.get("carry", b"") or b""
+            data = carry + f.read()
             state["offset"] = f.tell()
             state["inode"] = inode
+
+        # For UTF-16, ensure we don't cut a code unit in half.
+        if enc.startswith("utf-16") and (len(data) % 2 == 1):
+            state["carry"] = data[-1:]
+            data = data[:-1]
+        else:
+            state["carry"] = b""
+
+        text = data.decode(enc, errors="replace")
+        lines = [ln.strip("\r\n") for ln in text.splitlines() if ln.strip("\r\n")]
+
+        # If starting from 0, skip header only if it looks like one.
+        if prev_offset == 0 and lines:
+            if lines[0].lower().startswith("time,"):
+                lines = lines[1:]
+
+        import csv as _csv  # local import to avoid polluting module namespace
+
+        for line in lines:
+            try:
+                parts = next(_csv.reader([line]))
+            except Exception:
+                continue
+            if len(parts) < 10:
+                continue
+            rows.append(
+                {
+                    "time": parts[0],
+                    "symbol": parts[1],
+                    "event": parts[2],
+                    "side": parts[3],
+                    "volume": parts[4],
+                    "price": parts[5],
+                    "sl": parts[6],
+                    "tp": parts[7],
+                    "profit": parts[8],
+                    "reason": parts[9],
+                }
+            )
     except Exception as e:
         logger.warning("importer: failed reading %s (%s)", str(path), e)
         return []
 
     return rows
+
+
+def _resolve_aggressive_csv_source(src: Path) -> Path:
+    """
+    Accept either a directory, a correct file path, or the common mistake:
+    passing Common/Files/GoldScalper_AI_Bridge/trades_aggressive_v3.csv when
+    the file actually lives at Common/Files/trades_aggressive_v3.csv.
+    """
+    if src.exists() and src.is_dir():
+        return src / "trades_aggressive_v3.csv"
+
+    # If it doesn't exist, try to recover from the common mistake.
+    if not src.exists() and src.name == "trades_aggressive_v3.csv" and src.parent.name == "GoldScalper_AI_Bridge":
+        candidate = src.parent.parent / src.name
+        return candidate
+
+    return src
+
+
+def _read_csv_rows_all(path: Path, *, state: Dict[str, Any], logger: logging.Logger) -> list[dict[str, str]]:
+    """
+    Full-file read (robust). Used for MT5/Wine logs that may be UTF-16 and/or
+    tricky to tail reliably.
+    """
+    if not path.exists() or path.stat().st_size <= 0:
+        return []
+
+    def _detect_encoding(sample: bytes) -> str:
+        if sample.startswith(b"\xff\xfe"):
+            return "utf-16-le"
+        if sample.startswith(b"\xfe\xff"):
+            return "utf-16-be"
+        if sample.startswith(b"\xef\xbb\xbf"):
+            return "utf-8-sig"
+        if sample.count(b"\x00") > max(8, len(sample) // 10):
+            return "utf-16-le"
+        return "utf-8"
+
+    try:
+        data = path.read_bytes()
+    except Exception as e:
+        logger.warning("importer: failed reading %s (%s)", str(path), e)
+        return []
+
+    enc = state.get("encoding")
+    if not enc:
+        enc = _detect_encoding(data[:4096])
+        state["encoding"] = enc
+
+    # For UTF-16, ensure even length.
+    if str(enc).startswith("utf-16") and (len(data) % 2 == 1):
+        data = data[:-1]
+
+    text = data.decode(str(enc), errors="replace")
+    lines = [ln.strip("\r\n") for ln in text.splitlines() if ln.strip("\r\n")]
+
+    # Skip header only if it looks like one.
+    if lines and lines[0].lower().startswith("time,"):
+        lines = lines[1:]
+
+    import csv as _csv
+
+    out: list[dict[str, str]] = []
+    for line in lines:
+        try:
+            parts = next(_csv.reader([line]))
+        except Exception:
+            continue
+        if len(parts) < 10:
+            continue
+        out.append(
+            {
+                "time": parts[0].lstrip("\ufeff"),
+                "symbol": parts[1],
+                "event": parts[2],
+                "side": parts[3],
+                "volume": parts[4],
+                "price": parts[5],
+                "sl": parts[6],
+                "tp": parts[7],
+                "profit": parts[8],
+                "reason": parts[9],
+            }
+        )
+    return out
 
 
 def run_aggressive_trade_importer(csv_path: Path, out_logs: LogPaths) -> None:
@@ -651,10 +754,26 @@ def run_aggressive_trade_importer(csv_path: Path, out_logs: LogPaths) -> None:
     )
 
     log.info("Aggressive trade importer enabled (source): %s", str(csv_path))
+    seen: set[str] = set()
     while True:
         try:
-            new_rows = _tail_csv_rows_incremental(csv_path, state=state, logger=log)
-            for r in new_rows:
+            # Robust mode: read whole file and append only unseen events.
+            rows = _read_csv_rows_all(csv_path, state=state, logger=log)
+            appended = 0
+            for r in rows:
+                key = "|".join(
+                    [
+                        (r.get("time") or "").strip(),
+                        (r.get("symbol") or "").strip(),
+                        (r.get("event") or "").strip(),
+                        (r.get("side") or "").strip(),
+                        (r.get("volume") or "").strip(),
+                        (r.get("price") or "").strip(),
+                    ]
+                )
+                if not key or key in seen:
+                    continue
+                seen.add(key)
                 log_trade_event(
                     out_logs,
                     time=r.get("time", ""),
@@ -671,8 +790,61 @@ def run_aggressive_trade_importer(csv_path: Path, out_logs: LogPaths) -> None:
                     reason=(r.get("reason") or "").strip(),
                     extra={"source": "aggressive_v3", "raw_event": r.get("event", "")},
                 )
+                appended += 1
+            if appended:
+                log.info("Aggressive importer appended %d new rows", appended)
         except Exception as e:
             log.warning("Aggressive importer loop error: %s", e)
+        time.sleep(1.0)
+
+
+def run_aggressive_ml_importer(src: Path, dst_csv: Path) -> None:
+    """
+    Copy/append ML-ready rows produced by the EA (trades_aggressive_v3_ml.csv) into repo data folder.
+    This is a simple, deduped sync for training.
+    """
+    log = logging.getLogger("gold_scalper.importer_ml")
+    state: dict[str, Any] = {}
+    seen: set[str] = set()
+    log.info("Aggressive ML importer enabled (source): %s", str(src))
+    dst_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    header = "time,symbol,event,position_id,deal_id,side,volume,price,sl,tp,ema9,ema21,rsi,spread_pts,profit,reason\n"
+    if not dst_csv.exists() or dst_csv.stat().st_size <= 0:
+        dst_csv.write_text(header, encoding="utf-8")
+
+    while True:
+        try:
+            rows = _read_csv_rows_all(src, state=state, logger=log)
+            appended = 0
+            with dst_csv.open("a", encoding="utf-8", newline="") as f:
+                for r in rows:
+                    # this reader expects the old 10-col format; if it doesn't match, skip.
+                    # We'll parse ML file separately as raw lines below if needed.
+                    pass
+            # If we got here, it means src is not in the old format; fall back to raw text copy with dedupe.
+            raw = src.read_bytes()
+            enc = state.get("encoding") or ("utf-16-le" if raw.count(b"\x00") > max(8, len(raw) // 10) else "utf-8")
+            state["encoding"] = enc
+            if str(enc).startswith("utf-16") and (len(raw) % 2 == 1):
+                raw = raw[:-1]
+            text = raw.decode(str(enc), errors="replace")
+            lines = [ln.strip("\r\n") for ln in text.splitlines() if ln.strip("\r\n")]
+            if lines and lines[0].lower().startswith("time,"):
+                lines = lines[1:]
+            with dst_csv.open("a", encoding="utf-8", newline="") as f:
+                for line in lines:
+                    line = line.lstrip("\ufeff")
+                    key = line
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    f.write(line + "\n")
+                    appended += 1
+            if appended:
+                log.info("Aggressive ML importer appended %d new rows", appended)
+        except Exception as e:
+            log.warning("Aggressive ML importer loop error: %s", e)
         time.sleep(1.0)
 
 
@@ -731,13 +903,19 @@ def main() -> None:
         threads.append(t)
 
     if args.import_aggressive_trade_csv:
-        src = Path(args.import_aggressive_trade_csv).expanduser().resolve()
-        # Allow passing a directory (Common Files folder) instead of a file.
-        if src.exists() and src.is_dir():
-            src = src / "trades_aggressive_v3.csv"
+        src = _resolve_aggressive_csv_source(Path(args.import_aggressive_trade_csv).expanduser().resolve())
         log.info("Aggressive scalping CSVs will be written to: %s", str(aggressive_logs.data_dir))
         log.info(" - %s", str(aggressive_logs.trades_csv))
+        if not src.exists():
+            log.warning("Aggressive trade CSV source not found: %s", str(src))
         t = threading.Thread(target=run_aggressive_trade_importer, args=(src, aggressive_logs), daemon=True)
+        t.start()
+        threads.append(t)
+
+        # Also import ML-ready file if it exists (or if the user passed the Common Files directory).
+        ml_src = src.parent / "trades_aggressive_v3_ml.csv"
+        ml_dst = aggressive_logs.data_dir / "trades_ml.csv"
+        t = threading.Thread(target=run_aggressive_ml_importer, args=(ml_src, ml_dst), daemon=True)
         t.start()
         threads.append(t)
 
