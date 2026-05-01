@@ -528,7 +528,152 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--models-dir", default=None, help="Directory containing model.pkl (default: ./models)")
     p.add_argument("--file-bridge", action="store_true", help="Enable file-bridge responder")
     p.add_argument("--file-bridge-dir", default=None, help="Directory containing request.json/response.json")
+    p.add_argument(
+        "--import-aggressive-trade-csv",
+        default=None,
+        help=(
+            "Optional: absolute path to MT5 trades_aggressive_v3.csv to ingest into data/trades.csv. "
+            "Tip: copy the path printed by the EA in MT5 Experts."
+        ),
+    )
     return p.parse_args()
+
+def _tail_csv_rows_incremental(
+    path: Path,
+    *,
+    state: Dict[str, Any],
+    logger: logging.Logger,
+) -> list[dict[str, str]]:
+    """
+    Incrementally reads new CSV rows as the file grows.
+    Keeps state in `state` dict: {inode, offset}.
+    If the file is rotated/truncated, resets.
+    """
+    if not path.exists() or path.stat().st_size <= 0:
+        return []
+
+    try:
+        st = path.stat()
+        inode = getattr(st, "st_ino", None)
+        size = st.st_size
+    except Exception as e:
+        logger.debug("importer: stat failed for %s (%s)", str(path), e)
+        return []
+
+    prev_inode = state.get("inode")
+    prev_offset = int(state.get("offset", 0) or 0)
+    if prev_inode is None:
+        prev_inode = inode
+    # reset on rotate or truncate
+    if inode != prev_inode or prev_offset > size:
+        prev_offset = 0
+
+    rows: list[dict[str, str]] = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            if prev_offset > 0:
+                f.seek(prev_offset)
+            # If starting at 0, consume header line if present.
+            if prev_offset == 0:
+                _ = f.readline()
+            # Read remaining new lines.
+            for line in f:
+                line = line.strip("\n\r")
+                if not line:
+                    continue
+                # We expect: time,symbol,event,side,volume,price,sl,tp,profit,reason
+                parts = []
+                cur = ""
+                in_quotes = False
+                i = 0
+                while i < len(line):
+                    ch = line[i]
+                    if ch == '"' and (i + 1 < len(line) and line[i + 1] == '"'):
+                        cur += '"'
+                        i += 2
+                        continue
+                    if ch == '"':
+                        in_quotes = not in_quotes
+                        i += 1
+                        continue
+                    if ch == "," and not in_quotes:
+                        parts.append(cur)
+                        cur = ""
+                        i += 1
+                        continue
+                    cur += ch
+                    i += 1
+                parts.append(cur)
+                if len(parts) < 10:
+                    continue
+                rows.append(
+                    {
+                        "time": parts[0],
+                        "symbol": parts[1],
+                        "event": parts[2],
+                        "side": parts[3],
+                        "volume": parts[4],
+                        "price": parts[5],
+                        "sl": parts[6],
+                        "tp": parts[7],
+                        "profit": parts[8],
+                        "reason": parts[9],
+                    }
+                )
+            state["offset"] = f.tell()
+            state["inode"] = inode
+    except Exception as e:
+        logger.warning("importer: failed reading %s (%s)", str(path), e)
+        return []
+
+    return rows
+
+
+def run_aggressive_trade_importer(csv_path: Path, out_logs: LogPaths) -> None:
+    log = logging.getLogger("gold_scalper.importer")
+    state: Dict[str, Any] = {}
+    # Force-create the destination CSV so it appears immediately.
+    log_trade_event(
+        out_logs,
+        time=_now_iso(),
+        symbol="",
+        event="INIT",
+        magic=20260501,
+        ticket=None,
+        side="",
+        volume=None,
+        price=None,
+        sl=None,
+        tp=None,
+        profit=None,
+        reason="aggressive_importer_started",
+        extra={"source": "aggressive_v3"},
+    )
+
+    log.info("Aggressive trade importer enabled (source): %s", str(csv_path))
+    while True:
+        try:
+            new_rows = _tail_csv_rows_incremental(csv_path, state=state, logger=log)
+            for r in new_rows:
+                log_trade_event(
+                    out_logs,
+                    time=r.get("time", ""),
+                    symbol=r.get("symbol", ""),
+                    event=r.get("event", ""),
+                    magic=20260501,
+                    ticket=None,
+                    side=r.get("side", ""),
+                    volume=float(r["volume"]) if r.get("volume") not in (None, "", "nan") else None,
+                    price=float(r["price"]) if r.get("price") not in (None, "", "nan") else None,
+                    sl=float(r["sl"]) if r.get("sl") not in (None, "", "nan") else None,
+                    tp=float(r["tp"]) if r.get("tp") not in (None, "", "nan") else None,
+                    profit=float(r["profit"]) if r.get("profit") not in (None, "", "nan") else None,
+                    reason=(r.get("reason") or "").strip(),
+                    extra={"source": "aggressive_v3", "raw_event": r.get("event", "")},
+                )
+        except Exception as e:
+            log.warning("Aggressive importer loop error: %s", e)
+        time.sleep(1.0)
 
 
 def main() -> None:
@@ -561,6 +706,7 @@ def main() -> None:
             cfg.file_bridge_dir = cfg.data_dir / "bridge"
 
     logs = LogPaths(cfg.data_dir)
+    aggressive_logs = LogPaths(cfg.data_dir / "aggressive_scalping")
     model = AiModel(cfg.models_dir)
     loaded = model.load_if_available()
     if loaded:
@@ -581,6 +727,17 @@ def main() -> None:
 
     if cfg.enable_file_bridge:
         t = threading.Thread(target=run_file_bridge, args=(cfg, model, logs), daemon=True)
+        t.start()
+        threads.append(t)
+
+    if args.import_aggressive_trade_csv:
+        src = Path(args.import_aggressive_trade_csv).expanduser().resolve()
+        # Allow passing a directory (Common Files folder) instead of a file.
+        if src.exists() and src.is_dir():
+            src = src / "trades_aggressive_v3.csv"
+        log.info("Aggressive scalping CSVs will be written to: %s", str(aggressive_logs.data_dir))
+        log.info(" - %s", str(aggressive_logs.trades_csv))
+        t = threading.Thread(target=run_aggressive_trade_importer, args=(src, aggressive_logs), daemon=True)
         t.start()
         threads.append(t)
 

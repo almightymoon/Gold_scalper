@@ -41,7 +41,11 @@ The MT5 EA can write a request JSON file and read a response JSON file from **MT
 3) Start python with that directory:
 
 ```bash
-python3 ai_server.py --file-bridge --file-bridge-dir "/absolute/path/to/MT5/Common/Files/GoldScalper_AI_Bridge"
+python3 ai_server.py --file-bridge --file-bridge-dir "/Users/moon/Library/Application Support/net.metaquotes.wine.metatrader5/drive_c/users/user/AppData/Roaming/MetaQuotes/Terminal/Common/Files/GoldScalper_AI_Bridge"
+
+
+ python3 ai_server.py --import-aggressive-trade-csv "/Users/moon/Library/Application Support/net.metaquotes.wine.metatrader5/drive_c/users/user/AppData/Roaming/MetaQuotes/Terminal/Common/Files/GoldScalper_AI_Bridge"
+
 ```
 
 Files used:

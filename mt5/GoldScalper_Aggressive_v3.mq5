@@ -18,6 +18,9 @@ input int    SpreadLimit          = 60; // Gold often exceeds 60 pts on demo; ra
 input int    MaxLossStreak        = 3;
 input double MaxDailyLossPercent  = 5.0;
 input int    CooldownSeconds      = 5;
+input bool   EnableTradeLog       = true;
+input bool   TradeLogToCommonFolder = false; // true = Common\\Files (shared); false = this terminal MQL5\\Files (Open Data Folder)
+input string TradeLogCsv          = "trades_aggressive_v3.csv";
 
 // -----------------------------------
 // GLOBALS
@@ -39,6 +42,77 @@ string g_status_line = "starting";
 //+------------------------------------------------------------------+
 //| Helpers                                                          |
 //+------------------------------------------------------------------+
+string ToISO(datetime t)
+{
+   // Converts "YYYY.MM.DD HH:MI:SS" -> "YYYY-MM-DDTHH:MI:SSZ"
+   string s = TimeToString(t, TIME_DATE|TIME_SECONDS);
+   StringReplace(s, ".", "-");
+   StringReplace(s, " ", "T");
+   return s + "Z";
+}
+
+string CsvEscape(const string s)
+{
+   string out = s;
+   StringReplace(out, "\"", "\"\"");
+   return "\"" + out + "\"";
+}
+
+int TradeLogDiskFlags()
+{
+   return TradeLogToCommonFolder ? FILE_COMMON : 0;
+}
+
+string TradeLogResolvedHint()
+{
+   if(TradeLogToCommonFolder)
+      return "[COMMON] Files\\" + TradeLogCsv + "  -> MT5: File -> Open Common Data Folder -> Files";
+   string root = TerminalInfoString(TERMINAL_DATA_PATH);
+   return root + "\\MQL5\\Files\\" + TradeLogCsv + "  -> MT5: File -> Open Data Folder -> MQL5 -> Files";
+}
+
+bool WriteCSVHeaderIfNeeded(const string csv_file, const string header_line)
+{
+   int h = FileOpen(csv_file, FILE_READ|FILE_WRITE|FILE_CSV|TradeLogDiskFlags(), ',');
+   if(h == INVALID_HANDLE)
+   {
+      h = FileOpen(csv_file, FILE_WRITE|FILE_CSV|TradeLogDiskFlags(), ',');
+      if(h == INVALID_HANDLE) return false;
+      FileWriteString(h, header_line);
+      FileClose(h);
+      return true;
+   }
+   ulong size = (ulong)FileSize(h);
+   if(size <= 0)
+   {
+      FileSeek(h, 0, SEEK_SET);
+      FileWriteString(h, header_line);
+   }
+   FileClose(h);
+   return true;
+}
+
+void LogTradeEvent(const string iso_time, const string sym, const string event, const string side, double volume, double price, double sl, double tp, double profit, const string reason)
+{
+   if(!EnableTradeLog) return;
+   if(!WriteCSVHeaderIfNeeded(TradeLogCsv, "time,symbol,event,side,volume,price,sl,tp,profit,reason\n"))
+   {
+      Print("Trade log: header/create FAILED file=", TradeLogCsv, " err=", GetLastError(), " hint=", TradeLogResolvedHint());
+      return;
+   }
+   int h = FileOpen(TradeLogCsv, FILE_READ|FILE_WRITE|FILE_TXT|TradeLogDiskFlags());
+   if(h == INVALID_HANDLE)
+   {
+      Print("Trade log: open FAILED file=", TradeLogCsv, " err=", GetLastError(), " hint=", TradeLogResolvedHint());
+      return;
+   }
+   FileSeek(h, 0, SEEK_END);
+   string line = StringFormat("%s,%s,%s,%s,%.2f,%.5f,%.5f,%.5f,%.2f,%s\n",
+                              iso_time, sym, event, side, volume, price, sl, tp, profit, CsvEscape(reason));
+   FileWriteString(h, line);
+   FileClose(h);
+}
+
 void EnsureTradeFillingMode()
 {
    long fill = (long)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
@@ -304,6 +378,7 @@ void OpenTrade(const int signal)
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   string iso_time = ToISO(TimeGMT());
 
    if(_Point <= 0.0)
       return;
@@ -317,6 +392,7 @@ void OpenTrade(const int signal)
          g_status_line = "SKIP: not enough free margin even for min lot";
          Print("Skip: not enough free margin for min lot. desired=", DoubleToString(desired, 2),
                " freeMargin=", DoubleToString(AccountInfoDouble(ACCOUNT_FREEMARGIN), 2));
+         LogTradeEvent(iso_time, _Symbol, "SKIP", "BUY", desired, ask, 0.0, 0.0, 0.0, "not_enough_margin_min_lot");
          return;
       }
       double sl = NormalizeDouble(ask - SL_Points * _Point, digits);
@@ -327,11 +403,13 @@ void OpenTrade(const int signal)
          lastTradeTime = TimeCurrent();
          g_status_line = "BUY opened OK";
          Print("BUY opened vol=", DoubleToString(vol, 2), " SLpts=", SL_Points, " TPpts=", TP_Points);
+         LogTradeEvent(iso_time, _Symbol, "OPEN", "BUY", vol, ask, sl, tp, 0.0, "opened");
       }
       else
       {
          g_status_line = "BUY failed: " + trade.ResultRetcodeDescription();
          Print("BUY failed retcode=", (int)trade.ResultRetcode(), " desc=", trade.ResultRetcodeDescription());
+         LogTradeEvent(iso_time, _Symbol, "OPEN_FAIL", "BUY", vol, ask, sl, tp, 0.0, trade.ResultRetcodeDescription());
       }
       return;
    }
@@ -345,6 +423,7 @@ void OpenTrade(const int signal)
          g_status_line = "SKIP: not enough free margin even for min lot";
          Print("Skip: not enough free margin for min lot. desired=", DoubleToString(desired, 2),
                " freeMargin=", DoubleToString(AccountInfoDouble(ACCOUNT_FREEMARGIN), 2));
+         LogTradeEvent(iso_time, _Symbol, "SKIP", "SELL", desired, bid, 0.0, 0.0, 0.0, "not_enough_margin_min_lot");
          return;
       }
       double sl = NormalizeDouble(bid + SL_Points * _Point, digits);
@@ -355,11 +434,13 @@ void OpenTrade(const int signal)
          lastTradeTime = TimeCurrent();
          g_status_line = "SELL opened OK";
          Print("SELL opened vol=", DoubleToString(vol, 2), " SLpts=", SL_Points, " TPpts=", TP_Points);
+         LogTradeEvent(iso_time, _Symbol, "OPEN", "SELL", vol, bid, sl, tp, 0.0, "opened");
       }
       else
       {
          g_status_line = "SELL failed: " + trade.ResultRetcodeDescription();
          Print("SELL failed retcode=", (int)trade.ResultRetcode(), " desc=", trade.ResultRetcodeDescription());
+         LogTradeEvent(iso_time, _Symbol, "OPEN_FAIL", "SELL", vol, bid, sl, tp, 0.0, trade.ResultRetcodeDescription());
       }
       return;
    }
@@ -388,6 +469,13 @@ int OnInit()
    }
 
    Print("GoldScalper_Aggressive_v3 initialized. startBalance=", DoubleToString(startBalance, 2));
+   if(EnableTradeLog)
+   {
+      if(!WriteCSVHeaderIfNeeded(TradeLogCsv, "time,symbol,event,side,volume,price,sl,tp,profit,reason\n"))
+         Print("Trade log: FAILED to create ", TradeLogCsv, " err=", GetLastError());
+      else
+         Print("Trade log (repo data/ is NOT used — MT5 folder only): ", TradeLogResolvedHint());
+   }
    return INIT_SUCCEEDED;
 }
 
@@ -475,5 +563,39 @@ void OnTick()
    UpdateChartComment(spreadPts);
    OpenTrade(sig);
    UpdateChartComment(spreadPts);
+}
+
+void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
+{
+   if(!EnableTradeLog) return;
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
+      return;
+   ulong deal = trans.deal;
+   if(deal == 0)
+      return;
+   if(!HistoryDealSelect(deal))
+      return;
+
+   long magic = (long)HistoryDealGetInteger(deal, DEAL_MAGIC);
+   if((int)magic != MagicNumber)
+      return;
+   string sym = (string)HistoryDealGetString(deal, DEAL_SYMBOL);
+   if(sym != _Symbol)
+      return;
+
+   long entry = (long)HistoryDealGetInteger(deal, DEAL_ENTRY);
+   if(entry != DEAL_ENTRY_OUT)
+      return;
+
+   long dtype = (long)HistoryDealGetInteger(deal, DEAL_TYPE);
+   string side = (dtype == DEAL_TYPE_SELL ? "SELL" : "BUY");
+   double volume = HistoryDealGetDouble(deal, DEAL_VOLUME);
+   double price  = HistoryDealGetDouble(deal, DEAL_PRICE);
+   double profit = HistoryDealGetDouble(deal, DEAL_PROFIT);
+   double commission = HistoryDealGetDouble(deal, DEAL_COMMISSION);
+   double swap = HistoryDealGetDouble(deal, DEAL_SWAP);
+
+   string iso_time = ToISO(TimeGMT());
+   LogTradeEvent(iso_time, sym, "CLOSE", side, volume, price, 0.0, 0.0, (profit + commission + swap), "deal_close");
 }
 
