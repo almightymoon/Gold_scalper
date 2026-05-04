@@ -4,7 +4,7 @@
 //| Demo/backtest-first; MT5 enforces all risk protection            |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.05"
+#property version   "1.06"
 #property description "GoldScalper AI Bridge: MT5 EA sends features to Python, receives BUY/SELL/HOLD with confidence/SL/TP."
 
 #include <Trade\Trade.mqh>
@@ -663,6 +663,28 @@ bool BuildFeaturesJson(string &out_json)
    int trades_today = GetTradesToday();
    int hour_gmt = HourGMT(TimeGMT());
 
+   // Estimated SL points from ATR (aligned with python dummy_rule_ai) for volume_lots → aggressive ML feature parity
+   double base_atr = (m5_atr14 > 0.0 ? m5_atr14 : m1_atr14);
+   int sl_est = 150;
+   int tp_est = 270;
+   if(base_atr > 0.0 && point > 0.0)
+   {
+      int atr_pts = (int)MathMax(1, (int)MathRound(base_atr / point));
+      sl_est = (int)MathMin(320.0, MathMax(80.0, (double)MathRound(atr_pts * 1.2)));
+      tp_est = (int)MathMin(650.0, MathMax(150.0, (double)MathRound(atr_pts * 2.0)));
+   }
+   double volume_lots = 0.01;
+   double vb = 0.0, vs = 0.0;
+   string wb = "", ws = "";
+   bool okb = CalcVolumeForRisk(sym, ORDER_TYPE_BUY, ask, sl_est, vb, wb);
+   bool oks = CalcVolumeForRisk(sym, ORDER_TYPE_SELL, bid, sl_est, vs, ws);
+   if(okb && oks)
+      volume_lots = (vb + vs) / 2.0;
+   else if(okb)
+      volume_lots = vb;
+   else if(oks)
+      volume_lots = vs;
+
    string iso_time = TimeToISO(TimeGMT());
    string request_id = NewRequestId();
    g_last_request_id = request_id;
@@ -695,7 +717,8 @@ bool BuildFeaturesJson(string &out_json)
       "\"m5_minusdi\":" + DoubleToString(m5_minusdi, 2) + ","
       "\"hour_gmt\":" + (string)hour_gmt + ","
       "\"open_ea_trades\":" + (string)open_ea_trades + ","
-      "\"trades_today\":" + (string)trades_today +
+      "\"trades_today\":" + (string)trades_today + ","
+      "\"volume_lots\":" + DoubleToString(volume_lots, 4) +
       "}";
 
    out_json =

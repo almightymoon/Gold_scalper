@@ -15,7 +15,13 @@ import joblib
 import numpy as np
 import zmq
 
-from features import flatten_feature_packet, packet_to_dataframe_row, select_model_features
+from features import (
+    AGGRESSIVE_FEATURE_COLUMNS,
+    aggressive_feature_dataframe,
+    flatten_feature_packet,
+    packet_to_dataframe_row,
+    select_model_features,
+)
 from trade_logger import LogPaths, log_feature_packet, log_signal, log_trade_event
 
 
@@ -30,6 +36,8 @@ class ServerConfig:
     enable_file_bridge: bool = False
     file_bridge_dir: Optional[Path] = None
     file_poll_interval_s: float = 0.15
+    # If > 0: when aggressive model supplies p_win, force HOLD if p_win is below this (before MIN_CONF gate).
+    min_agg_pwin: float = 0.0
 
 
 def _now_iso() -> str:
@@ -106,6 +114,94 @@ class AiModel:
             return float(np.max(proba))
 
         # No proba available: treat prediction as weak confidence.
+        try:
+            pred = int(self.model.predict(X)[0])
+            return 0.60 if pred == 1 else 0.40
+        except Exception:
+            return None
+
+
+class AggressiveAiModel:
+    """
+    Classifier trained on aggressive_scalping trades_ml.csv (P(closed_profit > 0)).
+    Feature vector matches `AGGRESSIVE_FEATURE_COLUMNS` / model_train_aggressive.py.
+    """
+
+    def __init__(self, model_path: Path):
+        self.model_path = model_path
+        self.model: Any = None
+        self.feature_columns: Optional[list[str]] = None
+
+    def load_if_available(self) -> bool:
+        if not self.model_path.exists():
+            return False
+        payload = joblib.load(self.model_path)
+        if isinstance(payload, dict) and "model" in payload:
+            self.model = payload["model"]
+            self.feature_columns = payload.get("feature_columns") or list(AGGRESSIVE_FEATURE_COLUMNS)
+        else:
+            self.model = payload
+            self.feature_columns = list(AGGRESSIVE_FEATURE_COLUMNS)
+        return True
+
+    def predict_profit_probability(self, packet: Dict[str, Any], rule: Dict[str, Any]) -> Optional[float]:
+        """
+        Uses rule signal + SL/TP points and live bid/ask to build the same features as at trade open.
+        """
+        if self.model is None:
+            return None
+        sig = str(rule.get("signal") or "HOLD").upper()
+        if sig not in {"BUY", "SELL"}:
+            return None
+        sl_pts = int(rule.get("sl_points") or 0)
+        tp_pts = int(rule.get("tp_points") or 0)
+        if sl_pts <= 0 or tp_pts <= 0:
+            return None
+
+        f = packet.get("features", {}) or {}
+        bid = _safe_float(f, "bid")
+        ask = _safe_float(f, "ask")
+        spread_pts = float(_safe_int(f, "spread_points"))
+        ema9 = _safe_float(f, "m1_ema9")
+        ema21 = _safe_float(f, "m1_ema21")
+        rsi = _safe_float(f, "m1_rsi14")
+
+        point = 0.01
+        if np.isfinite(bid) and np.isfinite(ask) and spread_pts > 0:
+            inferred = (ask - bid) / spread_pts
+            if np.isfinite(inferred) and inferred > 0:
+                point = float(inferred)
+
+        if sig == "BUY":
+            price = ask
+            sl = price - sl_pts * point
+            tp = price + tp_pts * point
+        else:
+            price = bid
+            sl = price + sl_pts * point
+            tp = price - tp_pts * point
+
+        vol = _safe_float(f, "volume_lots")
+        if not np.isfinite(vol) or vol <= 0:
+            vol = 0.01
+
+        X = aggressive_feature_dataframe(ema9, ema21, rsi, spread_pts, price, sl, tp, sig, vol)
+        cols = self.feature_columns or list(AGGRESSIVE_FEATURE_COLUMNS)
+        for c in cols:
+            if c not in X.columns:
+                X[c] = 0.0
+        X = X[cols].astype(float)
+        X = X.fillna(0.0)
+
+        if hasattr(self.model, "predict_proba"):
+            proba = self.model.predict_proba(X)[0]
+            classes = list(getattr(self.model, "classes_", []))
+            if 1 in classes:
+                return float(_clamp(float(proba[classes.index(1)]), 0.0, 1.0))
+            if "1" in [str(c) for c in classes]:
+                return float(_clamp(float(proba[[str(c) for c in classes].index("1")]), 0.0, 1.0))
+            return float(_clamp(float(np.max(proba)), 0.0, 1.0))
+
         try:
             pred = int(self.model.predict(X)[0])
             return 0.60 if pred == 1 else 0.40
@@ -271,13 +367,30 @@ def dummy_rule_ai(packet: Dict[str, Any]) -> Dict[str, Any]:
     return {"signal": signal, "confidence": conf, "sl_points": sl_points, "tp_points": tp_points, "reason": reason}
 
 
-def decide(packet: Dict[str, Any], model: AiModel) -> Dict[str, Any]:
+def decide(
+    packet: Dict[str, Any],
+    model: AiModel,
+    aggressive: Optional[AggressiveAiModel] = None,
+    *,
+    min_agg_pwin: float = 0.0,
+) -> Dict[str, Any]:
     # Architecture note:
     # - Direction comes from the rule engine (BUY/SELL/HOLD)
-    # - The ML model is trained as a win-probability classifier (TP-before-SL), not direction
-    # - We use model output as a confidence overlay, never for lot sizing or risk overrides.
+    # - ML models are win-probability overlays (not direction), never for lot sizing or risk overrides.
     rule = dummy_rule_ai(packet)
-    p_win = model.predict_win_probability(packet)
+    p_win: Optional[float] = None
+    p_source = ""
+
+    if aggressive is not None and aggressive.model is not None:
+        p_win = aggressive.predict_profit_probability(packet, rule)
+        if p_win is not None:
+            p_source = "agg"
+
+    if p_win is None:
+        p_win = model.predict_win_probability(packet)
+        if p_win is not None:
+            p_source = "bridge"
+
     if p_win is None:
         resp = rule
     else:
@@ -286,10 +399,25 @@ def decide(packet: Dict[str, Any], model: AiModel) -> Dict[str, Any]:
         # Combine: keep rule as baseline, then nudge by model probability.
         combined = 0.55 * base_conf + 0.45 * p_win
         rule["confidence"] = float(_clamp(combined, 0.0, 1.0))
-        rule["reason"] = f"model_pwin={p_win:.2f} combined_conf={rule['confidence']:.2f} | {rule.get('reason','')}"
+        tag = f"{p_source}_pwin" if p_source else "pwin"
+        rule["reason"] = f"{tag}={p_win:.2f} combined_conf={rule['confidence']:.2f} | {rule.get('reason','')}"
         if rule.get("signal") == "HOLD":
             rule["confidence"] = min(rule["confidence"], 0.55)
         resp = rule
+
+    # Optional hard gate on aggressive P(profit>0) only (bridge model unaffected).
+    if (
+        min_agg_pwin > 0.0
+        and p_source == "agg"
+        and p_win is not None
+        and resp.get("signal") in {"BUY", "SELL"}
+        and float(p_win) < float(min_agg_pwin)
+    ):
+        resp["reason"] = (
+            f"filtered: agg_pwin={float(p_win):.3f} < {float(min_agg_pwin):.3f} | {resp.get('reason', '')}"
+        )
+        resp["signal"] = "HOLD"
+        resp["confidence"] = min(float(resp.get("confidence", 0.0) or 0.0), 0.55)
 
     # Server-side confidence filter (keeps MT5 risk controls intact)
     MIN_CONF = 0.58
@@ -303,7 +431,9 @@ def decide(packet: Dict[str, Any], model: AiModel) -> Dict[str, Any]:
 def _handle_packet(
     packet: Dict[str, Any],
     *,
+    cfg: ServerConfig,
     model: AiModel,
+    aggressive: Optional[AggressiveAiModel],
     logs: LogPaths,
     transport: str,
 ) -> Dict[str, Any]:
@@ -325,7 +455,7 @@ def _handle_packet(
         log_signal(logs, packet, resp, transport=transport)
         return resp
 
-    resp = decide(packet, model)
+    resp = decide(packet, model, aggressive=aggressive, min_agg_pwin=cfg.min_agg_pwin)
     # Safety: clamp and sanitize output
     resp = {
         "signal": (resp.get("signal", "HOLD") or "HOLD").upper(),
@@ -342,7 +472,12 @@ def _handle_packet(
     return resp
 
 
-def run_zmq_rep(cfg: ServerConfig, model: AiModel, logs: LogPaths) -> None:
+def run_zmq_rep(
+    cfg: ServerConfig,
+    model: AiModel,
+    aggressive: Optional[AggressiveAiModel],
+    logs: LogPaths,
+) -> None:
     ctx = zmq.Context.instance()
     sock = ctx.socket(zmq.REP)
     sock.setsockopt(zmq.LINGER, 0)
@@ -360,11 +495,18 @@ def run_zmq_rep(cfg: ServerConfig, model: AiModel, logs: LogPaths) -> None:
             sock.send_string(json.dumps(resp))
             continue
 
-        resp = _handle_packet(packet, model=model, logs=logs, transport="zmq")
+        resp = _handle_packet(packet, cfg=cfg, model=model, aggressive=aggressive, logs=logs, transport="zmq")
         sock.send_string(json.dumps(resp, ensure_ascii=False))
 
 
-def _tcp_client_handler(conn: socket.socket, addr: Tuple[str, int], cfg: ServerConfig, model: AiModel, logs: LogPaths) -> None:
+def _tcp_client_handler(
+    conn: socket.socket,
+    addr: Tuple[str, int],
+    cfg: ServerConfig,
+    model: AiModel,
+    aggressive: Optional[AggressiveAiModel],
+    logs: LogPaths,
+) -> None:
     try:
         conn.settimeout(8.0)
         buf = b""
@@ -384,7 +526,7 @@ def _tcp_client_handler(conn: socket.socket, addr: Tuple[str, int], cfg: ServerC
                     conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
                     continue
 
-                resp = _handle_packet(packet, model=model, logs=logs, transport="tcp")
+                resp = _handle_packet(packet, cfg=cfg, model=model, aggressive=aggressive, logs=logs, transport="tcp")
                 conn.sendall((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
     except Exception:
         return
@@ -395,7 +537,12 @@ def _tcp_client_handler(conn: socket.socket, addr: Tuple[str, int], cfg: ServerC
             pass
 
 
-def run_tcp_fallback(cfg: ServerConfig, model: AiModel, logs: LogPaths) -> None:
+def run_tcp_fallback(
+    cfg: ServerConfig,
+    model: AiModel,
+    aggressive: Optional[AggressiveAiModel],
+    logs: LogPaths,
+) -> None:
     log = logging.getLogger("gold_scalper")
     while True:
         try:
@@ -407,14 +554,23 @@ def run_tcp_fallback(cfg: ServerConfig, model: AiModel, logs: LogPaths) -> None:
 
             while True:
                 conn, addr = srv.accept()
-                th = threading.Thread(target=_tcp_client_handler, args=(conn, addr, cfg, model, logs), daemon=True)
+                th = threading.Thread(
+                    target=_tcp_client_handler,
+                    args=(conn, addr, cfg, model, aggressive, logs),
+                    daemon=True,
+                )
                 th.start()
         except Exception as e:
             log.exception("TCP fallback crashed: %s. Restarting in 5s...", e)
             time.sleep(5.0)
 
 
-def run_file_bridge(cfg: ServerConfig, model: AiModel, logs: LogPaths) -> None:
+def run_file_bridge(
+    cfg: ServerConfig,
+    model: AiModel,
+    aggressive: Optional[AggressiveAiModel],
+    logs: LogPaths,
+) -> None:
     assert cfg.file_bridge_dir is not None
     d = cfg.file_bridge_dir
     d.mkdir(parents=True, exist_ok=True)
@@ -465,7 +621,9 @@ def run_file_bridge(cfg: ServerConfig, model: AiModel, logs: LogPaths) -> None:
                                 "reason": "json_decode_error",
                             }
                         else:
-                            resp = _handle_packet(packet, model=model, logs=logs, transport="file")
+                            resp = _handle_packet(
+                                packet, cfg=cfg, model=model, aggressive=aggressive, logs=logs, transport="file"
+                            )
                     resp_path.write_text(json.dumps(resp, ensure_ascii=False), encoding="utf-8")
                     stamp_path.write_text(str(time.time()), encoding="utf-8")
 
@@ -526,6 +684,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-tcp", action="store_true", help="Disable TCP fallback server")
     p.add_argument("--data-dir", default=None, help="Directory for CSV logs (default: ../data)")
     p.add_argument("--models-dir", default=None, help="Directory containing model.pkl (default: ./models)")
+    p.add_argument(
+        "--no-aggressive-model",
+        action="store_true",
+        help="Do not load models/model_aggressive.pkl even if present (aggressive P(profit>0) overlay).",
+    )
+    p.add_argument(
+        "--min-agg-pwin",
+        type=float,
+        default=0.0,
+        help=(
+            "If >0 and the aggressive model supplied agg_pwin for a BUY/SELL, force HOLD when "
+            "agg_pwin is below this threshold (applied before the general confidence filter)."
+        ),
+    )
     p.add_argument("--file-bridge", action="store_true", help="Enable file-bridge responder")
     p.add_argument("--file-bridge-dir", default=None, help="Directory containing request.json/response.json")
     p.add_argument(
@@ -877,6 +1049,10 @@ def main() -> None:
             # Default to project-local bridge directory for convenience.
             cfg.file_bridge_dir = cfg.data_dir / "bridge"
 
+    cfg.min_agg_pwin = max(0.0, min(1.0, float(args.min_agg_pwin or 0.0)))
+    if cfg.min_agg_pwin > 0.0:
+        log.info("Aggressive hard filter enabled: min_agg_pwin=%.4f", cfg.min_agg_pwin)
+
     logs = LogPaths(cfg.data_dir)
     aggressive_logs = LogPaths(cfg.data_dir / "aggressive_scalping")
     model = AiModel(cfg.models_dir)
@@ -886,6 +1062,16 @@ def main() -> None:
     else:
         log.info("No model found at %s (using dummy rule logic)", str(model.model_path))
 
+    aggressive_model: Optional[AggressiveAiModel] = None
+    aggressive_path = cfg.models_dir / "model_aggressive.pkl"
+    if not args.no_aggressive_model:
+        am = AggressiveAiModel(aggressive_path)
+        if am.load_if_available():
+            aggressive_model = am
+            log.info("Loaded aggressive scalping model from %s", str(aggressive_path))
+        else:
+            log.info("No aggressive model at %s (skip agg overlay)", str(aggressive_path))
+
     log.info("Logging CSVs to: %s", str(cfg.data_dir))
     log.info(" - %s", str(logs.live_features_csv))
     log.info(" - %s", str(logs.signals_csv))
@@ -893,12 +1079,12 @@ def main() -> None:
 
     threads: list[threading.Thread] = []
     if cfg.enable_tcp_fallback:
-        t = threading.Thread(target=run_tcp_fallback, args=(cfg, model, logs), daemon=True)
+        t = threading.Thread(target=run_tcp_fallback, args=(cfg, model, aggressive_model, logs), daemon=True)
         t.start()
         threads.append(t)
 
     if cfg.enable_file_bridge:
-        t = threading.Thread(target=run_file_bridge, args=(cfg, model, logs), daemon=True)
+        t = threading.Thread(target=run_file_bridge, args=(cfg, model, aggressive_model, logs), daemon=True)
         t.start()
         threads.append(t)
 
@@ -920,7 +1106,7 @@ def main() -> None:
         threads.append(t)
 
     # Run ZMQ on main thread.
-    run_zmq_rep(cfg, model, logs)
+    run_zmq_rep(cfg, model, aggressive_model, logs)
 
 
 if __name__ == "__main__":

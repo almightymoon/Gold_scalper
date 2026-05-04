@@ -42,6 +42,7 @@ def flatten_feature_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
     out["hour_gmt"] = _safe_int(f.get("hour_gmt"))
     out["open_ea_trades"] = _safe_int(f.get("open_ea_trades"))
     out["trades_today"] = _safe_int(f.get("trades_today"))
+    out["volume_lots"] = _safe_float(f.get("volume_lots"))
 
     # GMT session bucket: 0=Asian, 1=London, 2=NY, 3=Overlap
     hour = int(out["hour_gmt"])
@@ -138,6 +139,59 @@ def packet_to_dataframe_row(packet: Dict[str, Any]) -> pd.DataFrame:
         **flatten_feature_packet(packet),
     }
     return pd.DataFrame([base])
+
+
+# Must match `model_train_aggressive.build_dataset` column order for inference.
+AGGRESSIVE_FEATURE_COLUMNS: List[str] = [
+    "ema_gap",
+    "rsi",
+    "spread_pts",
+    "sl_dist",
+    "tp_dist",
+    "volume",
+    "side_is_buy",
+]
+
+
+def aggressive_feature_dataframe(
+    ema9: float,
+    ema21: float,
+    rsi: float,
+    spread_pts: float,
+    price: float,
+    sl: float,
+    tp: float,
+    side: str,
+    volume: float,
+) -> pd.DataFrame:
+    """
+    One-row frame for `model_aggressive.pkl` (RandomForest trained on trades_ml OPEN rows).
+    Mirrors model_train_aggressive.build_dataset feature definitions.
+    """
+    e9 = _safe_float(ema9, default=np.nan)
+    e21 = _safe_float(ema21, default=np.nan)
+    r = _safe_float(rsi, default=np.nan)
+    sp = float(_safe_int(spread_pts, default=0))
+    px = _safe_float(price, default=np.nan)
+    slp = _safe_float(sl, default=np.nan)
+    tpp = _safe_float(tp, default=np.nan)
+    vol = _safe_float(volume, default=np.nan)
+    side_u = str(side).upper()
+    is_buy = 1 if side_u == "BUY" else 0
+
+    def _fz(x: float) -> float:
+        return 0.0 if (not np.isfinite(x)) else float(x)
+
+    row = {
+        "ema_gap": _fz(e9 - e21),
+        "rsi": _fz(r),
+        "spread_pts": _fz(sp),
+        "sl_dist": _fz(abs(px - slp)),
+        "tp_dist": _fz(abs(tpp - px)),
+        "volume": _fz(vol),
+        "side_is_buy": is_buy,
+    }
+    return pd.DataFrame([row])
 
 
 def select_model_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
