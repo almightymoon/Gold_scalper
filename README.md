@@ -83,4 +83,17 @@ python -m py_compile python/*.py
 python python/ai_server.py --file-bridge --file-bridge-dir "<MT5_COMMON_FILES_BRIDGE_DIR>"
 ```
 
+## Verification (repo health)
+
+From the repository root (`GoldScalper_AI_Bridge/`):
+
+```bash
+wc -l mt5/GoldScalper_Aggressive_v3.mq5
+wc -l mt5/GoldScalper_AI_Bridge.mq5
+python3 -m py_compile python/*.py
+pip install -r python/requirements.txt
+```
+
+Expect many lines per MQL5 file (not a single minified line). `py_compile` must exit with status 0.
+
   

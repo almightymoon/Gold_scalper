@@ -14,8 +14,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from sklearn.model_selection import TimeSeriesSplit
 
-from features import select_model_features
-from features import packet_to_dataframe_row
+from features import packet_to_dataframe_row, select_model_features
 
 
 @dataclass

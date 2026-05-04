@@ -908,26 +908,80 @@ bool ExecuteSignal(const string signal, double confidence, int sl_points, int tp
 
    // Hard kill switch: daily loss, etc.
    string why = "";
-   if(g_kill_switch) { why="kill_switch"; Print("Skip: ", why); LogTradeEvent(iso_time, sym, "SKIP", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why); return false; }
-   if(!InpAllowLiveTrading) { why="InpAllowLiveTrading=false"; Print("Skip: ", why); LogTradeEvent(iso_time, sym, "SKIP", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why); return false; }
-   if(signal != "BUY" && signal != "SELL") { why="signal_not_trade"; Print("Skip: signal=", signal); LogTradeEvent(iso_time, sym, "SKIP", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why); return false; }
-   if(!ConfidenceOk(confidence, why)) { Print("Skip: ", why); LogTradeEvent(iso_time, sym, "SKIP", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why); return false; }
-   if(!SpreadOk(spread_points, why)) { Print("Skip: ", why); LogTradeEvent(iso_time, sym, "SKIP", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why); return false; }
-   if(!BalanceOk(why)) { Print("Skip: ", why); LogTradeEvent(iso_time, sym, "SKIP", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why); return false; }
-   if(DailyLossHit(why)) { Print("Skip: ", why); LogTradeEvent(iso_time, sym, "KILL_SWITCH_ON", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why); g_kill_switch=true; return false; }
-   if(!TradesTodayOk(why)) { Print("Skip: ", why); LogTradeEvent(iso_time, sym, "SKIP", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why); return false; }
-   if(!OpenTradesOk(why)) { Print("Skip: ", why); LogTradeEvent(iso_time, sym, "SKIP", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why); return false; }
-   if(!StopsOk(sym, sl_points, tp_points, why)) { Print("Skip: ", why); LogTradeEvent(iso_time, sym, "SKIP", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why); return false; }
+   if(g_kill_switch)
+   {
+      why = "kill_switch";
+      Print("Skip: ", why);
+      LogTradeEvent(iso_time, sym, "SKIP", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why);
+      return false;
+   }
+   if(!InpAllowLiveTrading)
+   {
+      why = "InpAllowLiveTrading=false";
+      Print("Skip: ", why);
+      LogTradeEvent(iso_time, sym, "SKIP", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why);
+      return false;
+   }
+   if(signal != "BUY" && signal != "SELL")
+   {
+      why = "signal_not_trade";
+      Print("Skip: signal=", signal);
+      LogTradeEvent(iso_time, sym, "SKIP", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why);
+      return false;
+   }
+   if(!ConfidenceOk(confidence, why))
+   {
+      Print("Skip: ", why);
+      LogTradeEvent(iso_time, sym, "SKIP", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why);
+      return false;
+   }
+   if(!SpreadOk(spread_points, why))
+   {
+      Print("Skip: ", why);
+      LogTradeEvent(iso_time, sym, "SKIP", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why);
+      return false;
+   }
+   if(!BalanceOk(why))
+   {
+      Print("Skip: ", why);
+      LogTradeEvent(iso_time, sym, "SKIP", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why);
+      return false;
+   }
+   if(DailyLossHit(why))
+   {
+      Print("Skip: ", why);
+      LogTradeEvent(iso_time, sym, "KILL_SWITCH_ON", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why);
+      g_kill_switch = true;
+      return false;
+   }
+   if(!TradesTodayOk(why))
+   {
+      Print("Skip: ", why);
+      LogTradeEvent(iso_time, sym, "SKIP", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why);
+      return false;
+   }
+   if(!OpenTradesOk(why))
+   {
+      Print("Skip: ", why);
+      LogTradeEvent(iso_time, sym, "SKIP", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why);
+      return false;
+   }
+   if(!StopsOk(sym, sl_points, tp_points, why))
+   {
+      Print("Skip: ", why);
+      LogTradeEvent(iso_time, sym, "SKIP", signal, 0.0, 0.0, 0.0, 0.0, 0.0, why);
+      return false;
+   }
 
    double bid = SymbolInfoDouble(sym, SYMBOL_BID);
    double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
    double point = SymbolInfoDouble(sym, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
 
-   ENUM_ORDER_TYPE order_type = (signal=="BUY" ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
-   double entry = (signal=="BUY" ? ask : bid);
-   double sl = (signal=="BUY" ? entry - sl_points*point : entry + sl_points*point);
-   double tp = (signal=="BUY" ? entry + tp_points*point : entry - tp_points*point);
+   ENUM_ORDER_TYPE order_type = (signal == "BUY" ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+   double entry = (signal == "BUY" ? ask : bid);
+   double sl = (signal == "BUY" ? entry - sl_points * point : entry + sl_points * point);
+   double tp = (signal == "BUY" ? entry + tp_points * point : entry - tp_points * point);
 
    // Normalize prices
    sl = NormalizeDouble(sl, digits);
@@ -963,7 +1017,7 @@ bool ExecuteSignal(const string signal, double confidence, int sl_points, int tp
    rq.sl       = sl;
    rq.tp       = tp;
    rq.deviation= 20;
-   rq.type     = (signal=="BUY" ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+   rq.type     = (signal == "BUY" ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
    // Some MT5 builds do not expose CTrade::GetTypeFilling(); compute from symbol filling flags.
    long fill_flags = (long)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
    if((fill_flags & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) rq.type_filling = ORDER_FILLING_FOK;
@@ -1001,7 +1055,7 @@ bool ExecuteSignal(const string signal, double confidence, int sl_points, int tp
 
    bool ok=false;
    ResetLastError();
-   if(signal=="BUY")
+   if(signal == "BUY")
       ok = g_trade.Buy(volume, sym, entry, sl, tp, reason);
    else
       ok = g_trade.Sell(volume, sym, entry, sl, tp, reason);

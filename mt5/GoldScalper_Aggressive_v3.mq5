@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //| GoldScalper_Aggressive_v3.mq5                                    |
-//| Aggressive M1 micro-scalping EA (XAUUSD-optimized)               |
 //+------------------------------------------------------------------+
 #property strict
-
 #include <Trade\Trade.mqh>
+
+// Aggressive M1 micro-scalping EA (XAUUSD-optimized).
 
 // -----------------------------------
 // INPUTS
@@ -273,7 +273,7 @@ bool CanAffordVolume(const ENUM_ORDER_TYPE type, const double volume, const doub
    double margin = 0.0;
    if(!OrderCalcMargin(type, _Symbol, volume, price, margin))
       return false;
-   double freeMargin = AccountInfoDouble(ACCOUNT_FREEMARGIN);
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
    return (margin > 0.0 && freeMargin >= margin);
 }
 
@@ -459,7 +459,8 @@ void ManageOpenPositions()
          if(shouldMove)
          {
             double newTp = tp;
-            // If TP2 enabled, keep TP at TP2 target. If disabled, keep whatever TP is set.
+            // If TP2 enabled, keep TP at TP2 target.
+            // If disabled, keep whatever TP is set.
             if(EnableTP2)
             {
                if(type == POSITION_TYPE_BUY)  newTp = NormalizeDouble(open_price + TP2_Points * _Point, digits);
@@ -618,6 +619,52 @@ void UpdateLossTracking()
    lastCheck = now;
 }
 
+bool OrderCheckDeal(const ENUM_ORDER_TYPE otype, const double volume, const double price, const double sl, const double tp, string &why)
+{
+   why = "";
+   MqlTradeRequest rq;
+   MqlTradeCheckResult ck;
+   ZeroMemory(rq);
+   ZeroMemory(ck);
+   rq.action = TRADE_ACTION_DEAL;
+   rq.symbol = _Symbol;
+   rq.magic = (ulong)MagicNumber;
+   rq.volume = volume;
+   rq.price = price;
+   rq.sl = sl;
+   rq.tp = tp;
+   rq.deviation = 20;
+   rq.type = otype;
+   long fill_flags = (long)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   if((fill_flags & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
+      rq.type_filling = ORDER_FILLING_FOK;
+   else if((fill_flags & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
+      rq.type_filling = ORDER_FILLING_IOC;
+   else
+      rq.type_filling = ORDER_FILLING_RETURN;
+   rq.type_time = ORDER_TIME_GTC;
+
+   if(!OrderCheck(rq, ck))
+   {
+      why = StringFormat("OrderCheck failed (%d)", GetLastError());
+      return false;
+   }
+   string cmt = ck.comment;
+   StringToLower(cmt);
+   bool check_ok =
+      (ck.retcode == 0 && StringFind(cmt, "done") >= 0) ||
+      ck.retcode == TRADE_RETCODE_DONE ||
+      ck.retcode == TRADE_RETCODE_PLACED ||
+      ck.retcode == TRADE_RETCODE_DONE_PARTIAL;
+   if(!check_ok)
+   {
+      why = StringFormat("OrderCheck reject: retcode=%d comment=%s margin=%.2f free=%.2f",
+                         ck.retcode, ck.comment, ck.margin, AccountInfoDouble(ACCOUNT_MARGIN_FREE));
+      return false;
+   }
+   return true;
+}
+
 void OpenTradeOnce(const int signal)
 {
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
@@ -645,12 +692,21 @@ void OpenTradeOnce(const int signal)
       {
          g_status_line = "SKIP: not enough free margin even for min lot";
          Print("Skip: not enough free margin for min lot. desired=", DoubleToString(desired, 2),
-               " freeMargin=", DoubleToString(AccountInfoDouble(ACCOUNT_FREEMARGIN), 2));
+               " freeMargin=", DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2));
          LogTradeEvent(iso_time, _Symbol, "SKIP", "BUY", desired, ask, 0.0, 0.0, 0.0, "not_enough_margin_min_lot");
          return;
       }
       double sl = NormalizeDouble(ask - SL_Points * _Point, digits);
       double tp = NormalizeDouble(ask + (EnableTP2 ? TP2_Points : TP_Points) * _Point, digits);
+      string oc_why = "";
+      if(!OrderCheckDeal(ORDER_TYPE_BUY, vol, ask, sl, tp, oc_why))
+      {
+         g_status_line = "BUY OrderCheck failed: " + oc_why;
+         Print("BUY OrderCheck: ", oc_why);
+         LogTradeEvent(iso_time, _Symbol, "OPEN_FAIL", "BUY", vol, ask, sl, tp, 0.0, oc_why);
+         LogMlEvent(iso_time, _Symbol, "OPEN_FAIL", 0, 0, "BUY", vol, ask, sl, tp, ema9, ema21, rsi, spreadPts, 0.0, oc_why);
+         return;
+      }
       bool ok = trade.Buy(vol, _Symbol, ask, sl, tp, "Aggressive_v3");
       if(ok)
       {
@@ -682,12 +738,21 @@ void OpenTradeOnce(const int signal)
       {
          g_status_line = "SKIP: not enough free margin even for min lot";
          Print("Skip: not enough free margin for min lot. desired=", DoubleToString(desired, 2),
-               " freeMargin=", DoubleToString(AccountInfoDouble(ACCOUNT_FREEMARGIN), 2));
+               " freeMargin=", DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2));
          LogTradeEvent(iso_time, _Symbol, "SKIP", "SELL", desired, bid, 0.0, 0.0, 0.0, "not_enough_margin_min_lot");
          return;
       }
       double sl = NormalizeDouble(bid + SL_Points * _Point, digits);
       double tp = NormalizeDouble(bid - (EnableTP2 ? TP2_Points : TP_Points) * _Point, digits);
+      string oc_why = "";
+      if(!OrderCheckDeal(ORDER_TYPE_SELL, vol, bid, sl, tp, oc_why))
+      {
+         g_status_line = "SELL OrderCheck failed: " + oc_why;
+         Print("SELL OrderCheck: ", oc_why);
+         LogTradeEvent(iso_time, _Symbol, "OPEN_FAIL", "SELL", vol, bid, sl, tp, 0.0, oc_why);
+         LogMlEvent(iso_time, _Symbol, "OPEN_FAIL", 0, 0, "SELL", vol, bid, sl, tp, ema9, ema21, rsi, spreadPts, 0.0, oc_why);
+         return;
+      }
       bool ok = trade.Sell(vol, _Symbol, bid, sl, tp, "Aggressive_v3");
       if(ok)
       {

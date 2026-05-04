@@ -106,7 +106,8 @@ class AiModel:
         if hasattr(self.model, "predict_proba"):
             proba = self.model.predict_proba(X)[0]
             classes = list(getattr(self.model, "classes_", []))
-            # Expect binary {0,1}. If not, fall back to max probability.
+            # Expect binary {0,1}.
+            # If not, fall back to max probability.
             if 1 in classes:
                 return float(proba[classes.index(1)])
             if "1" in [str(c) for c in classes]:
@@ -709,6 +710,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     return p.parse_args()
+
 
 def _tail_csv_rows_incremental(
     path: Path,
