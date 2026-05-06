@@ -11,24 +11,51 @@
 // -----------------------------------
 input int    MagicNumber          = 20260501;
 input double RiskPercent          = 0.5;     // present per requirements (not used for lot sizing)
-input int    TP_Points            = 25;     // TP1
+input int    TP_Points            = 30;     // TP1 (raised default: logs showed avg win << avg loss)
 input int    TP2_Points           = 60;     // TP2 (runner)
-input int    SL_Points            = 120;    // wider initial SL to avoid early whipsaw
+input int    SL_Points            = 100;    // slightly tighter SL vs old 120 to cap worst-case $ per hit
 input bool   EnableTP2            = true;
 input double TP1_PartialClosePct  = 60.0;   // close this % at TP1, keep rest for TP2 (0 disables)
 input int    BreakEvenAfterPts    = 20;     // once in profit by this many points, move SL to entry
 input int    BreakEvenPlusPts     = 2;      // extra points beyond entry when moving to BE
 input int    TrailStartPts        = 35;     // start trailing after this profit (points)
 input int    TrailDistancePts     = 20;     // keep SL this far behind price (points)
-input int    MaxTrades            = 5;      // total concurrent positions this EA may hold
-input int    TypicalEntriesPerSignal = 5;   // desired stack size on strong signals (capped by MaxTrades)
+input int    MaxTrades            = 3;      // total concurrent positions (lowered: stacking amplified drawdowns in logs)
+input int    TypicalEntriesPerSignal = 2;   // desired stack on strong signals (was 5; fewer simultaneous losers)
 input int    MinEntriesPerSignal  = 1;      // weak signals still take at least 1 trade
+input int    MaxEntriesPerBar     = 1;      // hard cap new entries per bar (protects from double SL hits)
+input bool   ForceMinLot          = true;   // SAFETY: force broker min lot (prevents 0.03 lots after drawdown)
 input double StrongRsiBoost       = 6.0;    // extra RSI distance beyond threshold to scale up entries
 input int    StrongEmaGapPoints   = 25;     // EMA gap (points) to scale up entries
-input int    SpreadLimit          = 60; // Gold often exceeds 60 pts on demo; raise if chart shows spread BLOCKED
+input int    MinEmaGapPoints      = 10;     // require |EMA9-EMA21| this wide (points); 0 = off (18 was very quiet)
+input double BuyRsiMin            = 54.0;   // BUY RSI floor (56+ blocked too many valid bars in live)
+input double BuyRsiMax            = 68.0;   // skip very stretched BUY entries
+input double SellRsiMax           = 44.0;   // SELL only if RSI below this (stricter than old 48)
+input double SellRsiMin           = 20.0;   // avoid exhausted sells below this RSI (0 = off)
+input bool   EnableSessionFilter  = false;  // OFF by default: GMT 17-18 block was stopping EU evening trading; enable after you confirm hours
+input int    SessionBlockStart1   = 17;     // inclusive GMT hour
+input int    SessionBlockEnd1     = 19;     // exclusive: blocks 17,18
+input int    SessionBlockHour2    = 23;     // block this GMT hour
+input int    SessionBlockHour3    = 8;      // block this GMT hour (Asian window that bled in sample)
+input bool   EnableMaxHoldExit    = true;   // cut slow scratches before full SL (losers stayed open longer than winners in logs)
+input int    MaxHoldSeconds       = 45;     // if position age >= this and profit below threshold, market-close
+input int    MaxHoldMinProfitPts  = 4;      // scratch if profitPts < this at MaxHoldSeconds
+input bool   EnablePeakPullbackExit = true; // let winners run: close only after pullback from best profit (peak)
+input int    PeakStartProfitPts   = 25;     // start tracking pullback exit once peak >= this many points
+input int    PeakPullbackPts      = 12;     // close when current profit drops this many points from peak
+input int    SpreadLimit          = 50;     // slightly tighter default; raise if you see constant spread BLOCKED
 input int    MaxLossStreak        = 3;
 input double MaxDailyLossPercent  = 5.0;
-input int    CooldownSeconds      = 5;
+input int    CooldownSeconds      = 8;      // slightly longer to reduce machine-gun entries after same-bar logic
+input bool   UseIntrabarTiming    = true;   // true: arm on new bar, enter later in the same minute after delay/confirm
+input int    MinSecondsAfterBarOpen = 12;   // skip the chaotic first seconds of each M1 bar (your history showed :00 entries)
+input bool   RequirePullbackReclaim = true; // BUY: touch near EMA9 then bid above; SELL: mirror (uses live EMA9 shift 0)
+input int    PullbackTouchEmaPts  = 10;     // how close price must get to EMA9 (points) to count as pullback
+input int    ReclaimBeyondEmaPts  = 4;     // after touch, bid must be this far above EMA9 (BUY) / ask below (SELL)
+input int    MaxWaitSecondsInBar  = 45;     // after this many seconds, allow entry without pullback if trend still holds (0 = off)
+input int    TrendHoldBeyondEmaPts = 2;     // at MaxWaitSecondsInBar: require price to be this far on the correct side of EMA9
+input bool   EnableHourlyLossStop = true;   // pause new entries after large recent loss
+input double MaxLossLast60MinUSD  = 15.0;   // if closed PnL over last 60m <= -this, stop new entries (0 disables)
 input bool   EnableTradeLog       = true;
 input bool   TradeLogToCommonFolder = true; // true = Common\\Files (shared, easiest for python); false = this terminal MQL5\\Files (Open Data Folder)
 input string TradeLogCsv          = "trades_aggressive_v3.csv";
@@ -51,6 +78,13 @@ int hEma21 = INVALID_HANDLE;
 int hRsi14 = INVALID_HANDLE;
 
 string g_status_line = "starting";
+string g_margin_line = ""; // last computed min-lot margin hint for chart
+
+// Intrabar entry state (signal frozen from closed bar at bar open; execution later same bar)
+datetime g_last_signal_eval_bar = 0;
+int      g_pending_sig          = 0;
+int      g_pending_entries      = 1;
+bool     g_pullback_touched     = false;
 
 //+------------------------------------------------------------------+
 //| Helpers                                                          |
@@ -195,6 +229,22 @@ void UpdateChartComment(const int spread_pts)
    if(startBalance > 0.0)
       lossPct = (startBalance - AccountInfoDouble(ACCOUNT_EQUITY)) / startBalance * 100.0;
 
+   double vmin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double mBuy = 0.0, mSell = 0.0;
+   double freeM = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   g_margin_line = "";
+   if(vmin > 0.0 && OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, vmin, ask, mBuy) &&
+      OrderCalcMargin(ORDER_TYPE_SELL, _Symbol, vmin, bid, mSell))
+   {
+      g_margin_line =
+         "Min lot " + DoubleToString(vmin, 2) + " margin~ BUY " + DoubleToString(mBuy, 2) +
+         " SELL " + DoubleToString(mSell, 2) + " | free " + DoubleToString(freeM, 2) + "\n";
+      if(freeM < MathMax(mBuy, mSell) - 1e-6)
+         g_margin_line += "!! FREE MARGIN < min-lot margin: cannot open 0.01 XAU -> deposit, raise leverage, or use micro/c cent symbol\n";
+   }
+
    string txt =
       "GoldScalper_Aggressive_v3\n"
       "Spread(points): " + (string)spread_pts + " / max " + (string)SpreadLimit +
@@ -203,6 +253,7 @@ void UpdateChartComment(const int spread_pts)
       "Loss streak: " + (string)lossStreak + " / " + (string)MaxLossStreak + "\n"
       "Daily DD approx: " + DoubleToString(lossPct, 2) + "% / max " + DoubleToString(MaxDailyLossPercent, 2) + "%\n"
       "Cooldown(s): " + (string)CooldownSeconds + "\n"
+      + g_margin_line +
       "---\n"
       + g_status_line;
    Comment(txt);
@@ -211,22 +262,19 @@ void UpdateChartComment(const int spread_pts)
 //+------------------------------------------------------------------+
 //| Helpers                                                          |
 //+------------------------------------------------------------------+
-bool IsNewM1Candle()
+bool SessionBlocksNewEntries()
 {
-   static datetime lastBarTime = 0;
-   datetime t0 = iTime(_Symbol, PERIOD_M1, 0);
-   if(t0 <= 0)
+   if(!EnableSessionFilter)
       return false;
-   if(lastBarTime == 0)
-   {
-      lastBarTime = t0;
-      return false;
-   }
-   if(t0 != lastBarTime)
-   {
-      lastBarTime = t0;
+   MqlDateTime gmd;
+   TimeToStruct(TimeGMT(), gmd);
+   int h = gmd.hour;
+   if(SessionBlockEnd1 > SessionBlockStart1 && h >= SessionBlockStart1 && h < SessionBlockEnd1)
       return true;
-   }
+   if(SessionBlockHour2 >= 0 && h == SessionBlockHour2)
+      return true;
+   if(SessionBlockHour3 >= 0 && h == SessionBlockHour3)
+      return true;
    return false;
 }
 
@@ -260,12 +308,50 @@ double NormalizeVolume(double vol)
 
 double LotSizeForBalance()
 {
+   double vmin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double vmax = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double bal = AccountInfoDouble(ACCOUNT_BALANCE);
-   double vol = 0.01;
-   if(bal < 50.0) vol = 0.01;
-   else if(bal <= 100.0) vol = 0.02;
-   else vol = 0.03;
+   double eq  = AccountInfoDouble(ACCOUNT_EQUITY);
+   // Prefer broker minimum when equity is thin (after drawdown) so we at least *attempt* the smallest step.
+   double vol = 0.03;
+   if(ForceMinLot)
+      vol = vmin;
+   if(eq < 200.0 || bal < 200.0)
+      vol = 0.01;
+   if(eq < 120.0 || bal < 120.0)
+      vol = vmin;
+   vol = MathMax(vmin, MathMin(vol, vmax));
    return NormalizeVolume(vol);
+}
+
+double ClosedPnlLastSeconds(const int lookback_sec)
+{
+   datetime now = TimeCurrent();
+   datetime from = now - lookback_sec;
+   if(!HistorySelect(from, now))
+      return 0.0;
+   double sum = 0.0;
+   int deals = (int)HistoryDealsTotal();
+   for(int i = 0; i < deals; i++)
+   {
+      ulong deal = HistoryDealGetTicket(i);
+      if(deal == 0)
+         continue;
+      long mg = (long)HistoryDealGetInteger(deal, DEAL_MAGIC);
+      if((int)mg != MagicNumber)
+         continue;
+      string sym = (string)HistoryDealGetString(deal, DEAL_SYMBOL);
+      if(sym != _Symbol)
+         continue;
+      long entry = (long)HistoryDealGetInteger(deal, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_OUT)
+         continue;
+      double profit = HistoryDealGetDouble(deal, DEAL_PROFIT)
+                    + HistoryDealGetDouble(deal, DEAL_COMMISSION)
+                    + HistoryDealGetDouble(deal, DEAL_SWAP);
+      sum += profit;
+   }
+   return sum;
 }
 
 bool CanAffordVolume(const ENUM_ORDER_TYPE type, const double volume, const double price)
@@ -392,6 +478,32 @@ void MarkTP1Done(const ulong ticket)
    GlobalVariableSet(GV_TP1DoneName(ticket), 1.0);
 }
 
+string GV_PeakName(const ulong ticket)
+{
+   // ticket is POSITION_TICKET (same as position_id)
+   return "GSA3_PEAKPTS_" + (string)MagicNumber + "_" + (string)ticket;
+}
+
+double GetPeakPts(const ulong ticket)
+{
+   string n = GV_PeakName(ticket);
+   if(!GlobalVariableCheck(n))
+      return 0.0;
+   return GlobalVariableGet(n);
+}
+
+void SetPeakPts(const ulong ticket, const double v)
+{
+   GlobalVariableSet(GV_PeakName(ticket), v);
+}
+
+void ClearPeakPts(const ulong ticket)
+{
+   string n = GV_PeakName(ticket);
+   if(GlobalVariableCheck(n))
+      GlobalVariableDel(n);
+}
+
 void ManageOpenPositions()
 {
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -418,6 +530,47 @@ void ManageOpenPositions()
       double tp = PositionGetDouble(POSITION_TP);
 
       double profitPts = PointsProfitForPosition(type, open_price, bid, ask);
+
+      // Peak-pullback exit: if we had a good run-up, exit only when it starts to come back.
+      // This complements BE/trailing and helps avoid "bailing out early" on strong pushes.
+      if(EnablePeakPullbackExit && PeakStartProfitPts > 0 && PeakPullbackPts > 0)
+      {
+         double peak = GetPeakPts(ticket);
+         if(profitPts > peak)
+         {
+            peak = profitPts;
+            SetPeakPts(ticket, peak);
+         }
+         if(peak >= (double)PeakStartProfitPts && (peak - profitPts) >= (double)PeakPullbackPts)
+         {
+            bool closed = trade.PositionClose(ticket);
+            if(closed)
+               Print("PeakPullback exit ticket=", (string)ticket,
+                     " peakPts=", DoubleToString(peak, 1),
+                     " curPts=", DoubleToString(profitPts, 1));
+            else
+               Print("PeakPullback close failed ticket=", (string)ticket, " retcode=", (int)trade.ResultRetcode());
+            continue;
+         }
+      }
+
+      // Time stop: losers in sample stayed open longer than TP winners; scratch slow non-runners.
+      if(EnableMaxHoldExit && MaxHoldSeconds > 0)
+      {
+         datetime op = (datetime)PositionGetInteger(POSITION_TIME);
+         if((TimeCurrent() - op) >= MaxHoldSeconds && profitPts < (double)MaxHoldMinProfitPts)
+         {
+            bool closed = trade.PositionClose(ticket);
+            if(closed)
+            {
+               Print("MaxHold exit ticket=", (string)ticket, " age_s=", (string)(TimeCurrent() - op),
+                     " profitPts=", DoubleToString(profitPts, 1), " (CSV via OnTradeTransaction)");
+            }
+            else
+               Print("MaxHold close failed ticket=", (string)ticket, " retcode=", (int)trade.ResultRetcode());
+            continue;
+         }
+      }
 
       // TP1 partial close
       if(TP1_PartialClosePct > 0.0 && TP1_PartialClosePct < 100.0 && profitPts >= (double)TP_Points && !IsTP1Done(ticket))
@@ -535,11 +688,18 @@ bool GetSignalAndStrength(int &out_sig, int &out_entries)
    if(_Point > 0.0)
       emaGapPts = MathAbs(ema9 - ema21) / _Point;
 
+   if(MinEmaGapPoints > 0 && emaGapPts < (double)MinEmaGapPoints)
+   {
+      out_sig = 0;
+      out_entries = MinEntriesPerSignal;
+      return true;
+   }
+
    // BUY conditions
-   if(ema9 > ema21 && mid > ema9 && lastClose > lastOpen && rsi > 52.0)
+   if(ema9 > ema21 && mid > ema9 && lastClose > lastOpen && rsi > BuyRsiMin && rsi < BuyRsiMax)
    {
       out_sig = 1;
-      double rsiBoost = MathMax(0.0, rsi - 52.0);
+      double rsiBoost = MathMax(0.0, rsi - BuyRsiMin);
       int n = MinEntriesPerSignal;
       if(rsiBoost >= StrongRsiBoost) n++;
       if(emaGapPts >= (double)StrongEmaGapPoints) n++;
@@ -550,10 +710,13 @@ bool GetSignalAndStrength(int &out_sig, int &out_entries)
    }
 
    // SELL conditions
-   if(ema9 < ema21 && mid < ema9 && lastClose < lastOpen && rsi < 48.0)
+   bool sell_rsi_ok = (rsi < SellRsiMax);
+   if(SellRsiMin > 0.0)
+      sell_rsi_ok = sell_rsi_ok && (rsi > SellRsiMin);
+   if(ema9 < ema21 && mid < ema9 && lastClose < lastOpen && sell_rsi_ok)
    {
       out_sig = -1;
-      double rsiBoost = MathMax(0.0, 48.0 - rsi);
+      double rsiBoost = MathMax(0.0, SellRsiMax - rsi);
       int n = MinEntriesPerSignal;
       if(rsiBoost >= StrongRsiBoost) n++;
       if(emaGapPts >= (double)StrongEmaGapPoints) n++;
@@ -566,6 +729,74 @@ bool GetSignalAndStrength(int &out_sig, int &out_entries)
    out_sig = 0;
    out_entries = MinEntriesPerSignal;
    return true;
+}
+
+bool IntrabarEntryReady(const int sig)
+{
+   if(!UseIntrabarTiming)
+      return true;
+
+   datetime bar_open = iTime(_Symbol, PERIOD_M1, 0);
+   if(bar_open <= 0)
+      return false;
+
+   int sec_in = (int)(TimeCurrent() - bar_open);
+   if(sec_in < MinSecondsAfterBarOpen)
+      return false;
+
+   double ema9_0 = 0.0;
+   if(!CopyValue(hEma9, 0, 0, ema9_0))
+      return false;
+
+   MqlRates rr[];
+   ArraySetAsSeries(rr, true);
+   if(CopyRates(_Symbol, PERIOD_M1, 0, 1, rr) < 1)
+      return false;
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double pt = _Point;
+   if(pt <= 0.0)
+      return false;
+
+   // Optional: if we waited long enough in this bar, allow "trend continuation" entries
+   // even if no pullback touch happened, as long as price still holds on the correct side of EMA9.
+   if(MaxWaitSecondsInBar > 0 && sec_in >= MaxWaitSecondsInBar)
+   {
+      if(sig == 1)
+         return (bid >= ema9_0 + TrendHoldBeyondEmaPts * pt);
+      if(sig == -1)
+         return (ask <= ema9_0 - TrendHoldBeyondEmaPts * pt);
+   }
+
+   if(!RequirePullbackReclaim)
+      return true;
+
+   if(sig == 1)
+   {
+      if(!g_pullback_touched)
+      {
+         if(rr[0].low <= ema9_0 + PullbackTouchEmaPts * pt || bid <= ema9_0 + PullbackTouchEmaPts * pt)
+            g_pullback_touched = true;
+      }
+      if(!g_pullback_touched)
+         return false;
+      return (bid >= ema9_0 + ReclaimBeyondEmaPts * pt);
+   }
+
+   if(sig == -1)
+   {
+      if(!g_pullback_touched)
+      {
+         if(rr[0].high >= ema9_0 - PullbackTouchEmaPts * pt || ask >= ema9_0 - PullbackTouchEmaPts * pt)
+            g_pullback_touched = true;
+      }
+      if(!g_pullback_touched)
+         return false;
+      return (ask <= ema9_0 - ReclaimBeyondEmaPts * pt);
+   }
+
+   return false;
 }
 
 void UpdateLossTracking()
@@ -646,7 +877,19 @@ bool OrderCheckDeal(const ENUM_ORDER_TYPE otype, const double volume, const doub
 
    if(!OrderCheck(rq, ck))
    {
-      why = StringFormat("OrderCheck failed (%d)", GetLastError());
+      int ec = GetLastError();
+      // 4752 / context errors: often "auto trading disabled" in terminal, wrong account context, or symbol not tradable.
+      long sym_mode = (long)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
+      long term_tr = (long)TerminalInfoInteger(TERMINAL_TRADE_ALLOWED);
+      long mql_tr  = (long)MQLInfoInteger(MQL_TRADE_ALLOWED);
+      why = StringFormat(
+         "OrderCheck false err=%d | ck.retcode=%d ck.comment=[%s] | SYM_TRADE_MODE=%I64d TERM_TRADE=%I64d MQL_TRADE=%I64d",
+         ec, (int)ck.retcode, ck.comment, sym_mode, term_tr, mql_tr
+      );
+      if(ec == 4752 || StringFind(ck.comment, "auto", 0) >= 0 || StringFind(ck.comment, "Auto", 0) >= 0)
+         why += " | Enable AutoTrading (toolbar) + Tools->Options->Expert Advisors->Allow algorithmic trading";
+      if(sym_mode == SYMBOL_TRADE_MODE_DISABLED)
+         why += " | Symbol trading is DISABLED (check broker/symbol spec)";
       return false;
    }
    string cmt = ck.comment;
@@ -663,6 +906,24 @@ bool OrderCheckDeal(const ENUM_ORDER_TYPE otype, const double volume, const doub
       return false;
    }
    return true;
+}
+
+void NotifyMarginTooLow(const ENUM_ORDER_TYPE otype, const double price, const double desired,
+                        const string iso_time, const string log_side)
+{
+   double vmin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double mneed = 0.0;
+   if(!OrderCalcMargin(otype, _Symbol, vmin, price, mneed))
+      mneed = -1.0;
+   double freeM = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   if(mneed > 0.0)
+      g_status_line = StringFormat("SKIP: need ~%.2f margin for min lot %.2f, free %.2f", mneed, vmin, freeM);
+   else
+      g_status_line = "SKIP: not enough free margin (OrderCalcMargin failed)";
+   Print("Skip: NOT ENOUGH MARGIN for min lot. vmin=", DoubleToString(vmin, 2),
+         " margin~=", DoubleToString(mneed, 2), " freeMargin=", DoubleToString(freeM, 2),
+         " desired=", DoubleToString(desired, 2), " | Add funds, raise leverage, or use micro/cent XAU symbol.");
+   LogTradeEvent(iso_time, _Symbol, "SKIP", log_side, desired, price, 0.0, 0.0, 0.0, "not_enough_margin_min_lot");
 }
 
 void OpenTradeOnce(const int signal)
@@ -690,10 +951,7 @@ void OpenTradeOnce(const int signal)
       double vol = AffordableVolume(ORDER_TYPE_BUY, desired, ask);
       if(vol <= 0.0)
       {
-         g_status_line = "SKIP: not enough free margin even for min lot";
-         Print("Skip: not enough free margin for min lot. desired=", DoubleToString(desired, 2),
-               " freeMargin=", DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2));
-         LogTradeEvent(iso_time, _Symbol, "SKIP", "BUY", desired, ask, 0.0, 0.0, 0.0, "not_enough_margin_min_lot");
+         NotifyMarginTooLow(ORDER_TYPE_BUY, ask, desired, iso_time, "BUY");
          return;
       }
       double sl = NormalizeDouble(ask - SL_Points * _Point, digits);
@@ -736,10 +994,7 @@ void OpenTradeOnce(const int signal)
       double vol = AffordableVolume(ORDER_TYPE_SELL, desired, bid);
       if(vol <= 0.0)
       {
-         g_status_line = "SKIP: not enough free margin even for min lot";
-         Print("Skip: not enough free margin for min lot. desired=", DoubleToString(desired, 2),
-               " freeMargin=", DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2));
-         LogTradeEvent(iso_time, _Symbol, "SKIP", "SELL", desired, bid, 0.0, 0.0, 0.0, "not_enough_margin_min_lot");
+         NotifyMarginTooLow(ORDER_TYPE_SELL, bid, desired, iso_time, "SELL");
          return;
       }
       double sl = NormalizeDouble(bid + SL_Points * _Point, digits);
@@ -793,7 +1048,7 @@ int OnInit()
    startBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    trade.SetExpertMagicNumber((ulong)MagicNumber);
    EnsureTradeFillingMode();
-   g_status_line = "Waiting next M1 bar (checks once per new candle)";
+   g_status_line = "Waiting M1 bar (intrabar timing if enabled)";
    Comment("GoldScalper_Aggressive_v3 loading...");
 
    // Indicators on M1
@@ -835,7 +1090,7 @@ void OnDeinit(const int reason)
 
 void OnTick()
 {
-   // Manage existing positions every tick (BE / trailing / TP1 partial).
+   // Manage existing positions every tick (BE / trailing / TP1 partial / max-hold).
    ManageOpenPositions();
 
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -844,84 +1099,200 @@ void OnTick()
    if(_Point > 0.0)
       spreadPts = (int)MathRound((ask - bid) / _Point);
 
-   if(!IsNewM1Candle())
+   datetime bar0 = iTime(_Symbol, PERIOD_M1, 0);
+   if(bar0 <= 0)
    {
-      g_status_line = "Waiting new M1 candle (logic runs once per bar)";
       UpdateChartComment(spreadPts);
       return;
    }
 
-   g_status_line = "New M1 bar: evaluating...";
-   UpdateChartComment(spreadPts);
-
-   UpdateLossTracking();
-
-   double lossPct = 0.0;
-   if(!DailyLossOk(lossPct))
+   // --- New M1 bar: compute signal once (still uses CLOSED candle shift=1 in GetSignalAndStrength) ---
+   if(bar0 != g_last_signal_eval_bar)
    {
-      g_status_line = "SKIP: daily loss limit hit";
-      Print("Skip: daily loss limit hit ", DoubleToString(lossPct, 2), "% >=", DoubleToString(MaxDailyLossPercent, 2), "%");
+      g_last_signal_eval_bar = bar0;
+      g_pullback_touched = false;
+      g_pending_sig = 0;
+      g_pending_entries = MinEntriesPerSignal;
+
+      UpdateLossTracking();
+
+      double lossPct = 0.0;
+      if(!DailyLossOk(lossPct))
+      {
+         g_status_line = "SKIP: daily loss limit hit";
+         Print("Skip: daily loss limit hit ", DoubleToString(lossPct, 2), "% >=", DoubleToString(MaxDailyLossPercent, 2), "%");
+         UpdateChartComment(spreadPts);
+         return;
+      }
+
+      if(!SpreadOk(spreadPts))
+      {
+         g_status_line = "SKIP: spread too high for SpreadLimit (increase input on Gold)";
+         Print("Skip: spread too high ", (string)spreadPts, " > ", (string)SpreadLimit);
+         UpdateChartComment(spreadPts);
+         return;
+      }
+
+      if(SessionBlocksNewEntries())
+      {
+         g_status_line = "SKIP: session filter (GMT)";
+         Print("Skip: session filter blocks new entries this hour (GMT)");
+         UpdateChartComment(spreadPts);
+         return;
+      }
+
+      if(lossStreak >= MaxLossStreak)
+      {
+         g_status_line = "SKIP: loss streak limit";
+         Print("Skip: loss streak limit ", (string)lossStreak, " >= ", (string)MaxLossStreak);
+         UpdateChartComment(spreadPts);
+         return;
+      }
+
+      int openTrades = CountTrades();
+      if(openTrades >= MaxTrades)
+      {
+         g_status_line = "SKIP: max positions open";
+         Print("Skip: max trades reached ", (string)openTrades, " >= ", (string)MaxTrades);
+         UpdateChartComment(spreadPts);
+         return;
+      }
+
+      datetime now0 = TimeCurrent();
+      if(lastTradeTime > 0 && (now0 - lastTradeTime) < CooldownSeconds)
+      {
+         g_status_line = "SKIP: cooldown";
+         Print("Skip: cooldown ", (string)(now0 - lastTradeTime), "s < ", (string)CooldownSeconds, "s");
+         UpdateChartComment(spreadPts);
+         return;
+      }
+
+      int sig = 0;
+      int desiredEntries = MinEntriesPerSignal;
+      if(!GetSignalAndStrength(sig, desiredEntries))
+      {
+         g_status_line = "SKIP: indicator read failed";
+         Print("Skip: indicator read failed err=", GetLastError());
+         UpdateChartComment(spreadPts);
+         return;
+      }
+
+      if(sig == 0)
+      {
+         g_status_line = "SKIP: no EMA/RSI signal (closed bar)";
+         Print("Skip: no signal");
+         UpdateChartComment(spreadPts);
+         return;
+      }
+
+      if(!UseIntrabarTiming)
+      {
+         int openNow = CountTrades();
+         int room = MaxTrades - openNow;
+         int nOpen = (int)MathMax(1.0, MathMin((double)room, (double)desiredEntries));
+         if(MaxEntriesPerBar > 0)
+            nOpen = (int)MathMin((double)nOpen, (double)MaxEntriesPerBar);
+         g_status_line = (sig == 1 ? "Signal BUY: opening " : "Signal SELL: opening ") + (string)nOpen + " / " + (string)desiredEntries;
+         UpdateChartComment(spreadPts);
+         OpenTrades(sig, nOpen);
+         UpdateChartComment(spreadPts);
+         return;
+      }
+
+      g_pending_sig = sig;
+      g_pending_entries = desiredEntries;
+      g_status_line = (sig == 1 ? "Armed BUY" : "Armed SELL") + StringFormat(" | intrabar wait %ds+", MinSecondsAfterBarOpen);
       UpdateChartComment(spreadPts);
       return;
+   }
+
+   // --- Same M1 bar: re-check spread / limits every tick; open when intrabar timing satisfied ---
+   if(g_pending_sig == 0)
+   {
+      // Keep last g_status_line from new-bar evaluation (e.g. "no signal") — avoid spamming status each tick.
+      UpdateChartComment(spreadPts);
+      return;
+   }
+
+   if(EnableHourlyLossStop && MaxLossLast60MinUSD > 0.0)
+   {
+      double pnl60 = ClosedPnlLastSeconds(60 * 60);
+      if(pnl60 <= -MaxLossLast60MinUSD)
+      {
+         g_pending_sig = 0;
+         g_status_line = "SKIP: hourly loss stop (armed cancelled) pnl60=" + DoubleToString(pnl60, 2);
+         UpdateChartComment(spreadPts);
+         return;
+      }
    }
 
    if(!SpreadOk(spreadPts))
    {
-      g_status_line = "SKIP: spread too high for SpreadLimit (increase input on Gold)";
-      Print("Skip: spread too high ", (string)spreadPts, " > ", (string)SpreadLimit);
+      g_status_line = "SKIP: spread widened (armed signal cancelled)";
+      g_pending_sig = 0;
       UpdateChartComment(spreadPts);
       return;
    }
 
-   if(lossStreak >= MaxLossStreak)
+   if(lossStreak >= MaxLossStreak || SessionBlocksNewEntries())
    {
-      g_status_line = "SKIP: loss streak limit";
-      Print("Skip: loss streak limit ", (string)lossStreak, " >= ", (string)MaxLossStreak);
+      g_pending_sig = 0;
+      g_status_line = "SKIP: streak/session (armed cancelled)";
       UpdateChartComment(spreadPts);
       return;
    }
 
-   int openTrades = CountTrades();
-   if(openTrades >= MaxTrades)
+   int openNow2 = CountTrades();
+   if(openNow2 >= MaxTrades)
    {
-      g_status_line = "SKIP: max positions open";
-      Print("Skip: max trades reached ", (string)openTrades, " >= ", (string)MaxTrades);
+      g_pending_sig = 0;
+      g_status_line = "SKIP: max positions (armed cancelled)";
       UpdateChartComment(spreadPts);
       return;
    }
 
-   datetime now = TimeCurrent();
-   if(lastTradeTime > 0 && (now - lastTradeTime) < CooldownSeconds)
+   datetime now2 = TimeCurrent();
+   if(lastTradeTime > 0 && (now2 - lastTradeTime) < CooldownSeconds)
    {
-      g_status_line = "SKIP: cooldown";
-      Print("Skip: cooldown ", (string)(now - lastTradeTime), "s < ", (string)CooldownSeconds, "s");
+      int sec_in_bar = (int)(TimeCurrent() - bar0);
+      long cd_left = (long)CooldownSeconds - (long)(now2 - lastTradeTime);
+      if(cd_left < 0)
+         cd_left = 0;
+      g_status_line = StringFormat("Intrabar: cooldown %ds left (bar %ds)", (int)cd_left, sec_in_bar);
       UpdateChartComment(spreadPts);
       return;
    }
 
-   int sig = 0;
-   int desiredEntries = MinEntriesPerSignal;
-   if(!GetSignalAndStrength(sig, desiredEntries))
+   double lossPct2 = 0.0;
+   if(!DailyLossOk(lossPct2))
    {
-      g_status_line = "SKIP: indicator read failed";
-      Print("Skip: indicator read failed err=", GetLastError());
-      UpdateChartComment(spreadPts);
-      return;
-   }
-   if(sig == 0)
-   {
-      g_status_line = "SKIP: no EMA/RSI signal this bar";
-      Print("Skip: no signal");
+      g_pending_sig = 0;
+      g_status_line = "SKIP: daily loss limit (armed cancelled)";
       UpdateChartComment(spreadPts);
       return;
    }
 
-   int openNow = CountTrades();
-   int room = MaxTrades - openNow;
-   int nOpen = (int)MathMax(1.0, MathMin((double)room, (double)desiredEntries));
-   g_status_line = (sig == 1 ? "Signal BUY: opening " : "Signal SELL: opening ") + (string)nOpen + " / " + (string)desiredEntries;
+   if(!IntrabarEntryReady(g_pending_sig))
+   {
+      int sec_in_bar = (int)(TimeCurrent() - bar0);
+      if(UseIntrabarTiming && RequirePullbackReclaim)
+         g_status_line = StringFormat("Intrabar: bar %ds | pullback/reclaim wait (%s)", sec_in_bar, (g_pending_sig == 1 ? "BUY" : "SELL"));
+      else
+         g_status_line = StringFormat("Intrabar: bar %ds | wait %ds+", sec_in_bar, MinSecondsAfterBarOpen);
+      UpdateChartComment(spreadPts);
+      return;
+   }
+
+   int room2 = MaxTrades - openNow2;
+   int nOpen2 = (int)MathMax(1.0, MathMin((double)room2, (double)g_pending_entries));
+   if(MaxEntriesPerBar > 0)
+      nOpen2 = (int)MathMin((double)nOpen2, (double)MaxEntriesPerBar);
+   int sig_exec = g_pending_sig;
+   g_pending_sig = 0;
+
+   g_status_line = (sig_exec == 1 ? "Signal BUY: opening " : "Signal SELL: opening ") + (string)nOpen2 + " (intrabar timing OK)";
    UpdateChartComment(spreadPts);
-   OpenTrades(sig, nOpen);
+   OpenTrades(sig_exec, nOpen2);
    UpdateChartComment(spreadPts);
 }
 
@@ -961,5 +1332,11 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
    // ML close row (match by position_id)
    long pos_id = (long)HistoryDealGetInteger(deal, DEAL_POSITION_ID);
    LogMlEvent(iso_time, sym, "CLOSE", pos_id, (long)deal, side, volume, price, 0.0, 0.0, 0.0, 0.0, 0.0, 0, (profit + commission + swap), "deal_close");
+
+   // Cleanup per-position state
+   if(pos_id > 0)
+   {
+      ClearPeakPts((ulong)pos_id);
+   }
 }
 
