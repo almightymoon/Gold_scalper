@@ -11,51 +11,51 @@
 // -----------------------------------
 input int    MagicNumber          = 20260501;
 input double RiskPercent          = 0.5;     // present per requirements (not used for lot sizing)
-input int    TP_Points            = 30;     // TP1 (raised default: logs showed avg win << avg loss)
+input int    TP_Points            = 25;     // TP1
 input int    TP2_Points           = 60;     // TP2 (runner)
-input int    SL_Points            = 100;    // slightly tighter SL vs old 120 to cap worst-case $ per hit
+input int    SL_Points            = 120;    // wider initial SL to avoid early whipsaw
 input bool   EnableTP2            = true;
 input double TP1_PartialClosePct  = 60.0;   // close this % at TP1, keep rest for TP2 (0 disables)
 input int    BreakEvenAfterPts    = 20;     // once in profit by this many points, move SL to entry
 input int    BreakEvenPlusPts     = 2;      // extra points beyond entry when moving to BE
 input int    TrailStartPts        = 35;     // start trailing after this profit (points)
 input int    TrailDistancePts     = 20;     // keep SL this far behind price (points)
-input int    MaxTrades            = 3;      // total concurrent positions (lowered: stacking amplified drawdowns in logs)
-input int    TypicalEntriesPerSignal = 2;   // desired stack on strong signals (was 5; fewer simultaneous losers)
+input int    MaxTrades            = 5;      // total concurrent positions this EA may hold
+input int    TypicalEntriesPerSignal = 5;   // desired stack size on strong signals (capped by MaxTrades)
 input int    MinEntriesPerSignal  = 1;      // weak signals still take at least 1 trade
-input int    MaxEntriesPerBar     = 1;      // hard cap new entries per bar (protects from double SL hits)
-input bool   ForceMinLot          = true;   // SAFETY: force broker min lot (prevents 0.03 lots after drawdown)
+input int    MaxEntriesPerBar     = 999;    // disabled by default (kept for safety testing)
+input bool   ForceMinLot          = false;  // disabled by default
 input double StrongRsiBoost       = 6.0;    // extra RSI distance beyond threshold to scale up entries
 input int    StrongEmaGapPoints   = 25;     // EMA gap (points) to scale up entries
-input int    MinEmaGapPoints      = 10;     // require |EMA9-EMA21| this wide (points); 0 = off (18 was very quiet)
-input double BuyRsiMin            = 54.0;   // BUY RSI floor (56+ blocked too many valid bars in live)
+input int    MinEmaGapPoints      = 0;      // 0 = disabled (preserve original behavior)
+input double BuyRsiMin            = 52.0;   // preserve original behavior
 input double BuyRsiMax            = 68.0;   // skip very stretched BUY entries
-input double SellRsiMax           = 44.0;   // SELL only if RSI below this (stricter than old 48)
-input double SellRsiMin           = 20.0;   // avoid exhausted sells below this RSI (0 = off)
+input double SellRsiMax           = 48.0;   // preserve original behavior
+input double SellRsiMin           = 0.0;    // disabled by default
 input bool   EnableSessionFilter  = false;  // OFF by default: GMT 17-18 block was stopping EU evening trading; enable after you confirm hours
 input int    SessionBlockStart1   = 17;     // inclusive GMT hour
 input int    SessionBlockEnd1     = 19;     // exclusive: blocks 17,18
 input int    SessionBlockHour2    = 23;     // block this GMT hour
 input int    SessionBlockHour3    = 8;      // block this GMT hour (Asian window that bled in sample)
-input bool   EnableMaxHoldExit    = true;   // cut slow scratches before full SL (losers stayed open longer than winners in logs)
+input bool   EnableMaxHoldExit    = false;  // disabled by default (preserve original behavior)
 input int    MaxHoldSeconds       = 45;     // if position age >= this and profit below threshold, market-close
 input int    MaxHoldMinProfitPts  = 4;      // scratch if profitPts < this at MaxHoldSeconds
-input bool   EnablePeakPullbackExit = true; // let winners run: close only after pullback from best profit (peak)
+input bool   EnablePeakPullbackExit = false; // disabled by default (preserve original behavior)
 input int    PeakStartProfitPts   = 25;     // start tracking pullback exit once peak >= this many points
 input int    PeakPullbackPts      = 12;     // close when current profit drops this many points from peak
-input int    SpreadLimit          = 50;     // slightly tighter default; raise if you see constant spread BLOCKED
+input int    SpreadLimit          = 60;     // preserve original default
 input int    MaxLossStreak        = 3;
 input double MaxDailyLossPercent  = 5.0;
-input int    CooldownSeconds      = 8;      // slightly longer to reduce machine-gun entries after same-bar logic
-input bool   UseIntrabarTiming    = true;   // true: arm on new bar, enter later in the same minute after delay/confirm
-input int    MinSecondsAfterBarOpen = 12;   // skip the chaotic first seconds of each M1 bar (your history showed :00 entries)
-input bool   RequirePullbackReclaim = true; // BUY: touch near EMA9 then bid above; SELL: mirror (uses live EMA9 shift 0)
+input int    CooldownSeconds      = 5;      // preserve original default
+input bool   UseIntrabarTiming    = false;  // disabled by default (preserve original behavior)
+input int    MinSecondsAfterBarOpen = 12;   // unused unless intrabar enabled
+input bool   RequirePullbackReclaim = false; // disabled by default
 input int    PullbackTouchEmaPts  = 10;     // how close price must get to EMA9 (points) to count as pullback
 input int    ReclaimBeyondEmaPts  = 4;     // after touch, bid must be this far above EMA9 (BUY) / ask below (SELL)
-input int    MaxWaitSecondsInBar  = 45;     // after this many seconds, allow entry without pullback if trend still holds (0 = off)
+input int    MaxWaitSecondsInBar  = 0;      // disabled by default
 input int    TrendHoldBeyondEmaPts = 2;     // at MaxWaitSecondsInBar: require price to be this far on the correct side of EMA9
-input bool   EnableHourlyLossStop = true;   // pause new entries after large recent loss
-input double MaxLossLast60MinUSD  = 15.0;   // if closed PnL over last 60m <= -this, stop new entries (0 disables)
+input bool   EnableHourlyLossStop = false;  // disabled by default
+input double MaxLossLast60MinUSD  = 0.0;    // disabled by default
 input bool   EnableTradeLog       = true;
 input bool   TradeLogToCommonFolder = true; // true = Common\\Files (shared, easiest for python); false = this terminal MQL5\\Files (Open Data Folder)
 input string TradeLogCsv          = "trades_aggressive_v3.csv";
@@ -312,13 +312,12 @@ double LotSizeForBalance()
    double vmax = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double bal = AccountInfoDouble(ACCOUNT_BALANCE);
    double eq  = AccountInfoDouble(ACCOUNT_EQUITY);
-   // Prefer broker minimum when equity is thin (after drawdown) so we at least *attempt* the smallest step.
-   double vol = 0.03;
+   double vol = 0.01;
+   if(bal < 50.0) vol = 0.01;
+   else if(bal <= 100.0) vol = 0.02;
+   else vol = 0.03;
+   // Optional safety override (disabled by default)
    if(ForceMinLot)
-      vol = vmin;
-   if(eq < 200.0 || bal < 200.0)
-      vol = 0.01;
-   if(eq < 120.0 || bal < 120.0)
       vol = vmin;
    vol = MathMax(vmin, MathMin(vol, vmax));
    return NormalizeVolume(vol);
