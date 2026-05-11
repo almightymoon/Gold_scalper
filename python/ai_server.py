@@ -709,6 +709,25 @@ def parse_args() -> argparse.Namespace:
             "Tip: copy the path printed by the EA in MT5 Experts."
         ),
     )
+    p.add_argument(
+        "--mt5-live",
+        action="store_true",
+        help="Python-driven MT5 execution loop (technical analysis + order_send); terminal is gateway only.",
+    )
+    p.add_argument("--mt5-symbol", default="XAUUSD", help="Symbol exactly as in Market Watch")
+    p.add_argument("--mt5-poll-interval", type=float, default=5.0, help="Seconds between polling iterations")
+    p.add_argument("--mt5-volume", type=float, default=0.01, help="Lots per executed signal")
+    p.add_argument("--mt5-magic", type=int, default=770050, help="Magic number on bot orders")
+    p.add_argument("--mt5-deviation", type=int, default=40, help="Max price slippage/deviation (points)")
+    p.add_argument("--mt5-max-positions", type=int, default=1, help="Max concurrent positions (this magic + symbol)")
+    p.add_argument("--mt5-login", default=None, help="Account login (optional if terminal already logged in)")
+    p.add_argument("--mt5-password", default=None, help="Password (prefer env MT5_PASSWORD)")
+    p.add_argument("--mt5-server", default=None, help="Broker server (env MT5_SERVER)")
+    p.add_argument(
+        "--mt5-path",
+        default=None,
+        help="Path to MetaTrader 5 terminal executable (optional)",
+    )
     return p.parse_args()
 
 
@@ -1078,6 +1097,13 @@ def main() -> None:
     log.info(" - %s", str(logs.live_features_csv))
     log.info(" - %s", str(logs.signals_csv))
     log.info(" - %s", str(logs.trades_csv))
+
+    if args.mt5_live:
+        from mt5_live import run_mt5_live_main
+
+        log.info("Starting MT5 live mode (--mt5-live); ZMQ/TCP bridge servers are disabled.")
+        run_mt5_live_main(args, cfg, model, aggressive_model)
+        return
 
     threads: list[threading.Thread] = []
     if cfg.enable_tcp_fallback:

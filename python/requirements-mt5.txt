@@ -1,0 +1,4 @@
+# Optional: MetaTrader5 Python API (install only on supported OS/Python builds — often Windows).
+# pip install -r requirements.txt -r requirements-mt5.txt
+-r requirements.txt
+MetaTrader5>=5.0.45
