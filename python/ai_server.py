@@ -715,7 +715,23 @@ def parse_args() -> argparse.Namespace:
         help="Python-driven MT5 execution loop (technical analysis + order_send); terminal is gateway only.",
     )
     p.add_argument("--mt5-symbol", default="XAUUSD", help="Symbol exactly as in Market Watch")
-    p.add_argument("--mt5-poll-interval", type=float, default=5.0, help="Seconds between polling iterations")
+    p.add_argument(
+        "--mt5-poll-interval",
+        type=float,
+        default=5.0,
+        help=(
+            "Seconds between iterations when not using --mt5-wait-new-tick; "
+            "with --mt5-wait-new-tick, max seconds to wait for a new quote before running anyway."
+        ),
+    )
+    p.add_argument(
+        "--mt5-wait-new-tick",
+        action="store_true",
+        help=(
+            "After each cycle, block until symbol_info_tick().time_msc changes (new quote), "
+            "or mt5-poll-interval elapses — reduces fixed-timer lag on liquid symbols."
+        ),
+    )
     p.add_argument("--mt5-volume", type=float, default=0.01, help="Lots per executed signal")
     p.add_argument("--mt5-magic", type=int, default=770050, help="Magic number on bot orders")
     p.add_argument("--mt5-deviation", type=int, default=40, help="Max price slippage/deviation (points)")

@@ -46,6 +46,7 @@ def _mt5():
 class Mt5LiveSettings:
     symbol: str
     poll_interval_s: float
+    wait_new_tick: bool
     volume: float
     magic: int
     deviation: int
@@ -110,6 +111,33 @@ def rates_to_dataframe(rates: Optional[np.ndarray]) -> Any:
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
     return df
+
+
+def wait_for_new_tick_msc(
+    symbol: str,
+    last_time_msc: int,
+    *,
+    max_wait_s: float,
+    inner_sleep_s: float = 0.001,
+) -> int:
+    """
+    Block until `symbol_info_tick().time_msc` differs from `last_time_msc`, or `max_wait_s` elapses.
+
+    Uses a short inner sleep to avoid busy-spinning. When `last_time_msc == 0`, returns the current
+    tick time immediately (first iteration / no prior reference).
+    """
+    mt5 = _mt5()
+    t0 = mt5.symbol_info_tick(symbol)
+    if last_time_msc == 0 and t0 is not None:
+        return int(t0.time_msc)
+    deadline = time.monotonic() + max(0.0, float(max_wait_s))
+    while time.monotonic() < deadline:
+        t = mt5.symbol_info_tick(symbol)
+        if t is not None and int(t.time_msc) != int(last_time_msc):
+            return int(t.time_msc)
+        time.sleep(inner_sleep_s)
+    t1 = mt5.symbol_info_tick(symbol)
+    return int(t1.time_msc) if t1 is not None else int(last_time_msc)
 
 
 def fetch_market_ohlc(symbol: str, bars_m1: int = 600, bars_m5: int = 400) -> tuple[Any, Any]:
@@ -410,7 +438,12 @@ def run_mt5_live_loop(cfg: ServerConfig, settings: Mt5LiveSettings, model: AiMod
             except Exception as e:
                 log.exception("Live loop iteration error: %s", e)
 
-            time.sleep(settings.poll_interval_s)
+            if settings.wait_new_tick:
+                t_end = mt5.symbol_info_tick(symbol)
+                last_msc = int(t_end.time_msc) if t_end else 0
+                wait_for_new_tick_msc(symbol, last_msc, max_wait_s=settings.poll_interval_s)
+            else:
+                time.sleep(settings.poll_interval_s)
     finally:
         shutdown_mt5()
 
@@ -431,6 +464,7 @@ def run_mt5_live_main(args: Namespace, cfg: ServerConfig, model: AiModel, aggres
     settings = Mt5LiveSettings(
         symbol=str(args.mt5_symbol),
         poll_interval_s=float(args.mt5_poll_interval),
+        wait_new_tick=bool(getattr(args, "mt5_wait_new_tick", False)),
         volume=float(args.mt5_volume),
         magic=int(args.mt5_magic),
         deviation=int(args.mt5_deviation),
@@ -442,9 +476,10 @@ def run_mt5_live_main(args: Namespace, cfg: ServerConfig, model: AiModel, aggres
     )
 
     log.info(
-        "MT5 live executor: symbol=%s poll=%ss volume=%s magic=%s max_pos=%s",
+        "MT5 live executor: symbol=%s poll=%ss wait_new_tick=%s volume=%s magic=%s max_pos=%s",
         settings.symbol,
         settings.poll_interval_s,
+        settings.wait_new_tick,
         settings.volume,
         settings.magic,
         settings.max_positions,
